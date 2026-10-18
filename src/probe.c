@@ -688,6 +688,7 @@ static unsigned char *near_image_memory(size_t size) {
 #endif
     return memory;
 }
+volatile uint64_t guest_callback_rsp;   /* the guest's rsp when a callback was entered (read by the callback) */
 static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t image_size) {
     size_t count=0;
     const RuntimeGuestCallback *callbacks=runtime_guest_callbacks(&count);
@@ -722,6 +723,11 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         const uintptr_t base=(uintptr_t)image, host=(uintptr_t)c->callback;
         t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
         t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
+        /* the guest's rsp before the thunk (9 pushes below rbx) goes to guest_callback_rsp */
+        const uintptr_t rsp_slot=(uintptr_t)&guest_callback_rsp;
+        t[k++]=0x48; t[k++]=0x8d; t[k++]=0x43; t[k++]=0x48;         /* lea rax, [rbx+0x48] */
+        t[k++]=0x49; t[k++]=0xba; memcpy(t+k,&rsp_slot,8); k+=8;    /* movabs r10, &guest_callback_rsp */
+        t[k++]=0x49; t[k++]=0x89; t[k++]=0x02;                      /* mov [r10], rax */
         t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;        /* movabs rax, callback */
         t[k++]=0xff; t[k++]=0xd0;                                   /* call rax */
         for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x20+16x] */

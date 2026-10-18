@@ -24,6 +24,7 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+extern volatile uint64_t guest_callback_rsp;   /* probe.c: the guest's rsp when a callback was entered */
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -123,7 +124,7 @@ static struct {
     Bind keys[ACTIONS][2];
     int pad[16];               /* SDL_GamepadButton, PAD_TRIGGER_*, or -1 */
     int mouse_look, mouse_invert_y, pad_invert_y;
-    float mouse_sensitivity;
+    float mouse_sensitivity, mouse_aim_sensitivity;
 } input;
 
 static Bind parse_bind(const char *name) {
@@ -156,7 +157,7 @@ static void load_input(void) {
         set_keys(a,actions[a].keys);
         if (a<16) input.pad[a]=parse_pad(actions[a].pad);
     }
-    input.mouse_look=1; input.mouse_sensitivity=1.0f;
+    input.mouse_look=1; input.mouse_sensitivity=1.0f; input.mouse_aim_sensitivity=1.0f;
     const char *path=getenv("BB_INPUT_CONFIG");
     FILE *f=path && *path ? fopen(path,"r") : NULL;
     if (f) {
@@ -169,6 +170,7 @@ static void load_input(void) {
             const char *key=line, *value=eq+1;
             if (!strcmp(key,"mouse_look")) input.mouse_look=atoi(value)!=0;
             else if (!strcmp(key,"mouse_sensitivity")) input.mouse_sensitivity=(float)atof(value);
+            else if (!strcmp(key,"mouse_aim_sensitivity")) input.mouse_aim_sensitivity=(float)atof(value);
             else if (!strcmp(key,"mouse_invert_y")) input.mouse_invert_y=atoi(value)!=0;
             else if (!strcmp(key,"pad_invert_y")) input.pad_invert_y=atoi(value)!=0;
             else for (int a=0;a<ACTIONS;++a) {
@@ -181,6 +183,7 @@ static void load_input(void) {
                input.mouse_look ? "on" : "off",input.mouse_sensitivity);
     }
     if (input.mouse_sensitivity<=0.0f) input.mouse_sensitivity=1.0f;
+    if (input.mouse_aim_sensitivity<=0.0f) input.mouse_aim_sensitivity=1.0f;
     bbgpu_mouse_configure(input.mouse_look);
 }
 
@@ -222,7 +225,11 @@ static pthread_mutex_t camera_lock=PTHREAD_MUTEX_INITIALIZER;
 /* Mouse motion (pixels) not yet given to the follow camera [0] and to the joypad state [1]: each
  * gets all of it (the follow camera does not read the joypad's right stick values, the other
  * cameras do not use the follow camera's direction). */
-static float camera_dx[2], camera_dy[2];
+#define CAMERA_QUEUES 3                /* 0 follow camera, 1 joypad sticks, 2 aiming camera */
+static float camera_dx[CAMERA_QUEUES], camera_dy[CAMERA_QUEUES];
+/* U1: the camera time step (seconds, image+0xa4cb10 in CUSA02320 / CUSA02344 1.02) the cameras multiply
+ * their speeds with; it is 0 while the game is paused, and the mouse must not turn anything then. */
+#define U1B_CAMERA_DT 0xa4cb10
 static uint64_t camera_hook_us;       /* last follow camera callback: it turns with the mouse */
 static uint64_t sticks_hook_us;       /* last joypad callback: the mouse is a right stick value there */
 static float camera_test_rate=-1.0f;  /* BB_MOUSE_CAMERA_TEST=<degrees per frame>: constant turn */
@@ -230,6 +237,10 @@ static int mouse_debug(void) {
     static int on=-1;
     if (on<0) on=getenv("BB_MOUSE_DEBUG")!=NULL;
     return on;
+}
+static int camera_stopped(uint64_t image, uint32_t offset) {
+    if (!image || !offset) return 0;
+    return !(*(const volatile float *)(uintptr_t)(image+offset)>0.0f);
 }
 static int camera_take(int queue, float *dx, float *dy) {
     pthread_mutex_lock(&camera_lock);
@@ -273,7 +284,7 @@ static volatile float follow_correction;  /* degrees the direction is short of t
 static volatile float follow_push;        /* the right stick while the direction turns (-0.3, 0, 0.3) */
 static volatile int follow_has_arc;       /* the follow camera's vertical arc is known */
 /* arc_degrees: the camera pitch one unit of arc covers (U1 61; measured in U2 about 135, in U3 about 105, steeper upwards) */
-static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_offset, float arc_degrees) {
+static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_offset, float arc_degrees, int stopped) {
     const uint64_t now=now_us();
     follow_has_arc=arc_offset!=0;
     if (camera_hook_us && now-camera_hook_us>100000) {
@@ -287,6 +298,7 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
     float dx, dy;
     camera_take(0,&dx,&dy);
     if (aim_held) { follow_moved_us=0; follow_pending=0; return; } /* the aiming camera takes the mouse */
+    if (stopped) { follow_moved_us=0; follow_pending=0; follow_push=0.0f; follow_correction=0.0f; return; } /* paused */
     if (follow_pending) {
         float kept=wrap_degrees(heading-follow_before)/wrap_degrees(follow_after-follow_before);
         kept=kept<0.0f ? 0.0f : kept>1.0f ? 1.0f : kept;
@@ -359,17 +371,23 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
         *arc=v<0.0f ? 0.0f : v>1.0f ? 1.0f : v;
     }
 }
+static uint32_t u1_camera_dt_offset;  /* set by the callbacks of the versions whose time step is known */
 static void __attribute__((ms_abi)) u1_follow_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14) {
-    (void)unused; (void)image; (void)r14;
-    follow_camera(camera,0x1310,0x12bc,61.0f);
+    (void)unused; (void)r14;
+    follow_camera(camera,0x1310,0x12bc,61.0f,camera_stopped(image,u1_camera_dt_offset));
+}
+static void __attribute__((ms_abi)) u1b_follow_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14) {
+    (void)unused; (void)r14;
+    u1_camera_dt_offset=U1B_CAMERA_DT;
+    follow_camera(camera,0x1310,0x12bc,61.0f,camera_stopped(image,U1B_CAMERA_DT));
 }
 static void __attribute__((ms_abi)) u2_follow_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14) {
     (void)unused; (void)image; (void)r14;
-    follow_camera(camera,0x9ec0,0x9e60,135.0f);
+    follow_camera(camera,0x9ec0,0x9e60,135.0f,0);
 }
 static void __attribute__((ms_abi)) u3_follow_camera(uint64_t camera, uint64_t unused, uint64_t image, uint64_t r14) {
     (void)unused; (void)image; (void)r14;
-    follow_camera(camera,0x78c0,0x7874,105.0f);
+    follow_camera(camera,0x78c0,0x7874,105.0f,0);
 }
 static const unsigned char u1_follow_camera_code[]={
     0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x28,0x01,0x00,0x00,
@@ -414,8 +432,89 @@ static void __attribute__((ms_abi)) u1_pad_update(uint64_t state, uint64_t unuse
                (unsigned long long)image,(unsigned long long)(state-image));
     joypad_state=state;
 }
+static float aim_rate[2];             /* the smoothed aiming turn rate (degrees/s) */
+/* U1 1.02: while aiming (L2) the camera manager is sent a message every frame (handler image+0xb5780,
+ * message 0xa605802) that aligns the first camera stack entry with a transform: position at +0x00 and
+ * orientation quaternion (x y z w) at +0x10, apparently the player's. The aiming camera's yaw comes
+ * from it (image+0xb1fd0 turns the quaternion into angles), so whatever is written into the camera
+ * is brought back to it next frame; the stick turns it by 45 x|x| degrees/s at most (the stick is
+ * limited to the unit circle before the game sees it). The mouse's yaw is multiplied into this
+ * quaternion, about the vertical axis, just before the handler reads it (image+0xb5c62: rax = the
+ * message argument, a pointer to the transform's pointer, as the thunk saved it at guest_callback_rsp-16),
+ * and the stick's x is left out while this runs. The turn is spread over a few frames so that single
+ * pixels do not step. A positive turn is a turn to the right (the yaw angle lowers). */
+/* U1 1.02: the camera manager (image+0xb5e50, per entry image+0xb60d0) runs a stack of three cameras
+ * while aiming (L2): the follow camera, the aiming camera (update image+0xb7430) and, on top with a
+ * blend weight of 1, the zoom camera (update image+0xc43b0), whose output is the picture; the lower
+ * ones do not count. A camera's output block (rsp + 0x120 of the manager's function, rsp as the callback
+ * was entered is guest_callback_rsp) is a position (+0x00) and Euler angles in degrees: yaw +0x20,
+ * pitch +0x24. With the stick the camera turns 45 x|x| degrees/s at most (the stick is limited to the
+ * unit circle before the game sees it). The mouse's yaw is added to the zoom camera's output right
+ * after its update (image+0xb62a7: vmovaps xmm0, [rsp+0x120] ...), and to the angles the manager keeps
+ * for it (stack entry = the thunk's saved rbx, yaw at +0x70) for the next frame; the stick's x is left
+ * out while this runs. The turn is spread over a few frames so that single pixels do not step. A
+ * positive turn is a turn to the right (the yaw angle lowers). */
+static uint64_t aim_native_us;        /* last frame the zoom camera was turned by the mouse */
+static float aim_pending_degrees;     /* the mouse's yaw not given to the zoom camera yet */
+static float aim_pending_pitch;       /* its pitch (degrees, positive looks down) */
+static void __attribute__((ms_abi)) u1b_aim_camera(uint64_t unused0, uint64_t unused1, uint64_t image, uint64_t camera) {
+    (void)unused0; (void)unused1;
+    if (!aim_held || camera<0x10000) return;
+    const uint64_t vtable=*(const uint64_t *)(uintptr_t)camera;
+    if (vtable<0x10000 || ((const uint64_t *)(uintptr_t)vtable)[0x98/8]!=image+0xc43b0) return;
+    const uint64_t now=now_us();
+    /* two instances of the zoom camera (one per shoulder) are updated in the same frame while the shoulder
+     * is switched: both get the same turn, the mouse's motion being taken once per frame */
+    static uint64_t frame_us; static float frame_step, frame_pitch;
+    float step, step_pitch;
+    if (frame_us && now-frame_us<1500) {
+        step=frame_step; step_pitch=frame_pitch;
+    } else {
+        if (aim_native_us && now-aim_native_us>100000) aim_pending_degrees=aim_pending_pitch=0.0f;
+        float dx, dy;
+        camera_take(2,&dx,&dy);
+        if (camera_stopped(image,U1B_CAMERA_DT)) { aim_pending_degrees=aim_pending_pitch=0.0f; return; } /* paused */
+        aim_pending_degrees+=dx*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity*input.mouse_aim_sensitivity;
+        aim_pending_pitch+=(input.mouse_invert_y ? -dy : dy)*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity*input.mouse_aim_sensitivity;
+        float dt=*(const volatile float *)(uintptr_t)(image+U1B_CAMERA_DT);
+        if (!(dt>0.0005f && dt<0.05f)) dt=1.0f/60.0f;
+        const float follow=1.0f-SDL_expf(-dt/0.02f); /* about 20 ms behind the mouse */
+        step=aim_pending_degrees*follow; step_pitch=aim_pending_pitch*follow;
+        aim_pending_degrees-=step;
+        aim_pending_pitch-=step_pitch;
+        frame_us=now; frame_step=step; frame_pitch=step_pitch;
+    }
+    aim_native_us=now;
+    if (step==0.0f && step_pitch==0.0f) return;
+    /* the zoom camera orbits the player: its aim vector (x y z w floats at +0x1830, from the player towards the picture's far side) is its state, worked out again each frame from the previous one, so a turn written only into the output was lost */
+    float *aim=(float *)(uintptr_t)(camera+0x1830);
+    float *yaw=(float *)(uintptr_t)(guest_callback_rsp+0x140);
+    float *pitch=yaw+1; /* the output's pitch angle follows (degrees, positive looks down) */
+    const uint64_t entry=*(const uint64_t *)(uintptr_t)(guest_callback_rsp-72);
+    if (step!=0.0f) {
+        const float a=step*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
+        const float ax=aim[0], az=aim[2];
+        aim[0]=ax*c-az*s;
+        aim[2]=ax*s+az*c;
+        *yaw=wrap_degrees(*yaw-step);
+    }
+    if (step_pitch!=0.0f) {
+        /* the aim vector looks from the camera to the player, so looking down lowers its elevation */
+        const float h=SDL_sqrtf(aim[0]*aim[0]+aim[2]*aim[2]);
+        if (h>1e-4f) {
+            float e=SDL_atan2f(aim[1],h)*57.29578f;
+            float e2=e-step_pitch;
+            e2=e2>70.0f ? 70.0f : e2<-70.0f ? -70.0f : e2;
+            const float r=e2*0.017453293f, k=SDL_cosf(r)/h;
+            aim[0]*=k; aim[2]*=k; aim[1]=SDL_sinf(r);
+            *pitch-=e2-e;
+        }
+    }
+    if (entry>0x10000) { *(float *)(uintptr_t)(entry+0x70)=*yaw; *(float *)(uintptr_t)(entry+0x74)=*pitch; }
+    if (mouse_debug()) printf("Mouse: aimturn t=%.4f camera=%#llx step=%.3f pitch step=%.3f yaw=%.3f pitch=%.3f aim=(%.3f %.3f %.3f)\n",now*1e-6,(unsigned long long)camera,step,step_pitch,*yaw,*pitch,aim[0],aim[1],aim[2]);
+}
 static void __attribute__((ms_abi)) u1_joypad_sticks(uint64_t unused0, uint64_t unused1, uint64_t image, uint64_t r14) {
-    (void)unused0; (void)unused1; (void)image;
+    (void)unused0; (void)unused1;
     if (!joypad_state || r14-0x62!=joypad_state) return; /* pad 0 only */
     const uint64_t now=now_us();
     sticks_hook_us=now;
@@ -423,19 +522,26 @@ static void __attribute__((ms_abi)) u1_joypad_sticks(uint64_t unused0, uint64_t 
     sticks_last_us=now;
     if (dt<1.0f/480.0f) dt=1.0f/480.0f;
     if (dt>0.05f) dt=0.05f;
+    /* the game turns by rate * its own camera time step: use it, the wall clock jitters */
+    if (u1_camera_dt_offset) {
+        const float game_dt=*(const volatile float *)(uintptr_t)(image+u1_camera_dt_offset);
+        if (game_dt>0.0005f && game_dt<0.05f) dt=game_dt;
+    }
     static float follow_test=-1.0f;   /* BB_MOUSE_FOLLOW_TEST=<x>: right stick x everywhere (measuring) */
     if (follow_test<0.0f) { const char *t=getenv("BB_MOUSE_FOLLOW_TEST"); follow_test=t ? (float)atof(t) : 0.0f; }
     if (follow_test>0.0f) { ((float *)(uintptr_t)joypad_state)[2]+=follow_test; ((float *)(uintptr_t)joypad_state)[6]+=follow_test; return; }
     float dx, dy;
     camera_take(1,&dx,&dy);
+    if (camera_stopped(image,u1_camera_dt_offset)) return; /* paused */
     if (aim_test<0.0f) { const char *t=getenv("BB_MOUSE_AIM_TEST"); aim_test=t ? (float)atof(t) : 0.0f; }
     float *pad=(float *)(uintptr_t)joypad_state;
+    if (!aim_held) { float ix, iy; camera_take(2,&ix,&iy); } /* the aiming camera's queue fills in free look too */
     float x=0.0f, y=0.0f;
     if (aim_test>0.0f) x=aim_test;
     else {
         /* the turn rate (degrees/s) the mouse asks for, through the inverse of the aiming curve
          * measured in U1: 45 x^2 degrees/s up to x = 1, then about 54 x - 9 (x = 3: 152, x = 6: 324) */
-        const float scale=MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity/dt;
+        const float scale=MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity*(aim_held ? input.mouse_aim_sensitivity : 1.0f)/dt;
         const int following=camera_hook_us && now-camera_hook_us<50000;
         float push=0.0f;
         if (!aim_held && following && follow_direct) { /* the follow camera turned itself */
@@ -445,8 +551,24 @@ static void __attribute__((ms_abi)) u1_joypad_sticks(uint64_t unused0, uint64_t 
         float (*curve)(float)=aim_held ? aim_stick : follow_stick;
         /* following through the joypad: the shortfall is made up within about a quarter second */
         const float extra=!aim_held && following && !follow_direct ? follow_correction*4.0f : 0.0f;
-        x=curve(dx*scale+extra)+push;
-        y=curve((input.mouse_invert_y ? -dy : dy)*scale);
+        float rate_x=dx*scale+extra, rate_y=(input.mouse_invert_y ? -dy : dy)*scale;
+        if (aim_held) {
+            /* the mouse reports a pixel or two now and then: at low speeds that is one-frame pulses and
+             * the aim moved in steps. The turn rate is smoothed over about 30 ms (the angle turned stays
+             * the same). */
+            const float alpha=1.0f-SDL_expf(-dt/0.03f);
+            aim_rate[0]+=alpha*(rate_x-aim_rate[0]);
+            aim_rate[1]+=alpha*(rate_y-aim_rate[1]);
+            if (aim_rate[0]>-0.3f && aim_rate[0]<0.3f && rate_x==0.0f) aim_rate[0]=0.0f;
+            if (aim_rate[1]>-0.3f && aim_rate[1]<0.3f && rate_y==0.0f) aim_rate[1]=0.0f;
+            rate_x=aim_rate[0]; rate_y=aim_rate[1];
+        } else {
+            aim_rate[0]=aim_rate[1]=0.0f;
+        }
+        /* the zoom camera is not updated for a few frames when the shoulder is switched: keep the stick out of it */
+        const int native_yaw=aim_held && aim_native_us && now-aim_native_us<600000;
+        x=native_yaw ? 0.0f : curve(rate_x)+push;
+        y=native_yaw ? 0.0f : curve(rate_y);
     }
     if (mouse_debug()) printf("Mouse: aim t=%.4f dt=%.4f dx=%.1f x=%.3f game=%.3f\n",now*1e-6,dt,dx,x,pad[2]);
     if (x!=0.0f) { pad[2]+=x; pad[6]+=x; }
@@ -459,6 +581,22 @@ static const unsigned char u1_pad_update_code[]={
 static const unsigned char u1_joypad_sticks_code[]={
     0x80,0x7c,0x01,0x6d,0x00,0x74,0x3b,0xc5,0xe2,0x59,0x64,0x01,0x40,0xc4,0xc1,0x7a,0x11,0x66,0xbe,0xc5,
     0xe2,0x59,0x64,0x01,
+};
+/* U1 of CUSA02320 / CUSA02344 (1.02): the same three functions, moved (+0xf0, +0x150, +0x150) with other
+ * rip-relative operands; the code and the structures they use are the same. */
+static const unsigned char u1b_follow_camera_code[]={
+    0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x28,0x01,0x00,0x00,
+    0x44,0x89,0x8d,0x00,0xff,0xff,0xff,0x49,0x89,0xcd,0x48,0x89,0xd3,0x49,0x89,0xf7,0x49,0x89,0xfc,
+    0x4c,0x8b,0x35,0x42,0xbd,0x89,0x00,0x49,0x8b,
+};
+static const unsigned char u1b_pad_update_code[]={
+    0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xb8,0x00,0x00,0x00,
+    0x49,0x89,0xfe,0x4c,0x8b,0x2d,0xe2,0x37,0x83,0x00,0x49,0x8b,
+};
+/* image+0xb62a7 in the camera manager, right after the call of the camera's update (r14 = the camera):
+ * vmovaps xmm0, [rsp+0x120]; vmovaps [rsp+0x160], xmm0 */
+static const unsigned char u1b_aim_camera_code[]={
+    0xc5,0xf8,0x28,0x84,0x24,0x20,0x01,0x00,0x00,0xc5,0xf8,0x29,0x84,0x24,0x60,0x01,0x00,0x00,
 };
 /* U2 UpdateFocus (player-base.cpp:1101): the camera's look-at spring went NaN once at 240 Hz and
  * the game's assertion ended it. The assertion's call now restarts the spring at the player's
@@ -505,6 +643,10 @@ static const RuntimeGuestCallback guest_callbacks[]={
     {"U1 follow camera (mouse)",0xaecf0,u1_follow_camera_code,sizeof(u1_follow_camera_code),6,u1_follow_camera,NULL},
     {"U1 pad update (mouse)",0x117200,u1_pad_update_code,sizeof(u1_pad_update_code),6,u1_pad_update,NULL},
     {"U1 joypad sticks (mouse)",0x11784e,u1_joypad_sticks_code,sizeof(u1_joypad_sticks_code),5,u1_joypad_sticks,NULL},
+    {"U1 follow camera (mouse, 1.02)",0xaede0,u1b_follow_camera_code,sizeof(u1b_follow_camera_code),6,u1b_follow_camera,NULL},
+    {"U1 pad update (mouse, 1.02)",0x117350,u1b_pad_update_code,sizeof(u1b_pad_update_code),6,u1_pad_update,NULL},
+    {"U1 joypad sticks (mouse, 1.02)",0x11799e,u1_joypad_sticks_code,sizeof(u1_joypad_sticks_code),5,u1_joypad_sticks,NULL},
+    {"U1 aiming camera (mouse, 1.02)",0xb62a7,u1b_aim_camera_code,sizeof(u1b_aim_camera_code),9,u1b_aim_camera,NULL},
     {"U2 follow camera (mouse)",0x171fe0,u2_follow_camera_code,sizeof(u2_follow_camera_code),6,u2_follow_camera,NULL},
     {"U3 follow camera (mouse)",0x121b90,u3_follow_camera_code,sizeof(u3_follow_camera_code),6,u3_follow_camera,NULL},
     {"U2 camera focus NaN reset",0x33ba13,u2_focus_assert_code,sizeof(u2_focus_assert_code),
@@ -594,8 +736,9 @@ static void sample_host(PadData *d) {
     pthread_mutex_lock(&camera_lock);
     const int following=camera_hook_us && now-camera_hook_us<100000;
     const int joypad=sticks_hook_us && now-sticks_hook_us<100000;
-    for (int q=0;q<2;++q) {
-        if (captured && (following || joypad)) { camera_dx[q]+=mdx; camera_dy[q]+=mdy; }
+    for (int q=0;q<CAMERA_QUEUES;++q) {
+        /* queue 2 is the zoom camera's (U1 aiming): nothing else reads it, so it stays empty outside the aim */
+        if (captured && (following || joypad) && (q!=2 || aim_held)) { camera_dx[q]+=mdx; camera_dy[q]+=mdy; }
         else { camera_dx[q]=camera_dy[q]=0; }
     }
     pthread_mutex_unlock(&camera_lock);
@@ -760,7 +903,7 @@ static void sample(PadData *d) {
         float dt=(float)(inject_now-mouse_inject_us)*1e-6f;
         if (dt>0.1f) dt=0.1f;
         pthread_mutex_lock(&camera_lock);
-        for (int q=0;q<2;++q) { camera_dx[q]+=injected.mouse[0]*dt; camera_dy[q]+=injected.mouse[1]*dt; }
+        for (int q=0;q<CAMERA_QUEUES;++q) { camera_dx[q]+=injected.mouse[0]*dt; camera_dy[q]+=injected.mouse[1]*dt; }
         pthread_mutex_unlock(&camera_lock);
     }
     mouse_inject_us=inject_now;
