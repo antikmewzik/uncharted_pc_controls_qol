@@ -1,3 +1,10 @@
+UNOFFICIAL FORK BUILD
+This is a fork of SuperMedo's Uncharted PC port (0.3.6) with keyboard, mouse and controller
+improvements for Uncharted 1 (Uncharted 2 and 3 pending). It is not affiliated with SuperMedo:
+do not report problems with this build to him.
+Releases and issues: https://github.com/antikmewzik/uncharted_pc_controls_qol
+-------------------------------------------------------------------------------------------
+
 Uncharted: The Nathan Drake Collection for Windows
 ===================================================
 

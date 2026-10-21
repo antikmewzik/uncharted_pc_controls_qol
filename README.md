@@ -1,3 +1,24 @@
+> **Unofficial fork of [SuperMedo's Uncharted PC port](https://github.com/Supermedo/uncharted_pc).**
+> Not affiliated with SuperMedo. Please do not report problems with this fork to him: use the
+> [Issues](../../issues) tab here. The original README follows below.
+
+## About this fork
+
+This fork adds native keyboard, mouse and controller handling to **Uncharted 1** (Uncharted 2
+and 3 are pending): keyboard and mouse in the menus and in game, mouse camera, dynamic button
+prompts for keyboard and mouse, Xbox and PlayStation controllers, live switching between
+devices, and a key rebinding sub-menu in the Controls menu.
+
+- **Download:** see the [Releases](../../releases) page. Unzip, run `Uncharted.exe`, pick your
+  game folder and press PLAY.
+- **Source:** branch [`u1-mkb-qol`](../../tree/u1-mkb-qol). Licensed under the GPL v2 like the
+  original.
+- **No game files are included.** You need your own decrypted dump of the collection.
+
+The full list of changes and the known problems are in each release's notes.
+
+---
+
 # Uncharted: The Nathan Drake Collection for Windows
 
 **Uncharted 1, 2 and 3 from the PS4 collection running natively on Windows 10 and 11, by [SuperMedo](https://github.com/Supermedo).** Mohammed Albarghouthi
