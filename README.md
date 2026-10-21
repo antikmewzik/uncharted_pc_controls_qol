@@ -1,6 +1,8 @@
 > **Unofficial fork of [SuperMedo's Uncharted PC port](https://github.com/Supermedo/uncharted_pc).**
 > Not affiliated with SuperMedo. Please do not report problems with this fork to him: use the
-> [Issues](../../issues) tab here. The original README follows below.
+> [Issues](../../issues) tab here.
+
+**[⬇ Download the latest release](../../releases)**
 
 ---
 
@@ -8,37 +10,96 @@
 
 YES ✅ (as of 21 Oct 2026)
 
-# Uncharted PC - Controls and user experience QoL changes
+# Uncharted PC - Full mouse and keyboard controls and user experience QoL changes
 
-This fork aims to transform **Uncharted 1** _(Uncharted 2 and 3 are pending)_ by adding full keyboard and mouse controls in game and in the menus, with dynamic button prompts and instant input method switching.
+This fork aims to transform **Uncharted 1** _(Uncharted 2 and 3 will follow)_ by adding full keyboard and mouse controls in game and in the menus, with dynamic button prompts and instant input method switching.
 
-## Full mouse control
+## Full mouse and keyboard control
+
+### Gameplay
 
 <table>
   <tr>
-    <td><img src="https://github.com/user-attachments/assets/aac36114-f668-4217-be89-7c7748fd0ff7" width="270" alt="look_mouse"></td>
-    <td><img src="https://github.com/user-attachments/assets/86887212-8b3b-41f2-b909-7d93c83d6b61" width="270" alt="mouse_grenade"></td>
-    <td><img src="https://github.com/user-attachments/assets/d53b034b-da9b-4329-9be1-03469a8091a1" width="270" alt="mouse_gameplay"></td>
+    <td><img src="https://github.com/user-attachments/assets/aac36114-f668-4217-be89-7c7748fd0ff7" width="270" alt="Mouse look"></td>
+    <td><img src="https://github.com/user-attachments/assets/86887212-8b3b-41f2-b909-7d93c83d6b61" width="270" alt="Grenade with the mouse"></td>
+    <td><img src="https://github.com/user-attachments/assets/d53b034b-da9b-4329-9be1-03469a8091a1" width="270" alt="Mouse gameplay"></td>
+  </tr>
+</table>
+
+The game is now fully playable using mouse and keyboard. Looking around, aiming and shooting while standing or in cover works naturally. Mouse and aim sensitivity sliders have been added to the options to personalise your experience. Some gameplay sequences have been improved so you don't have to press keys that feel unnatural.
+
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/9f8d18f1-e8f5-4d78-9cd5-80bf6f57007d" width="270" alt="No more weird key bindings"></td>
   </tr>
   <tr>
-    <td align="center"><em>Mouse look</em></td>
-    <td align="center"><em>Grenade with the mouse</em></td>
-    <td align="center"><em>Mouse gameplay</em></td>
+    <td align="center"><em>No more weird key bindings</em></td>
+  </tr>
+</table>
+
+### Menus
+
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/22c5eafe-9f28-46e1-bb5a-1bd13e2e6238" width="405" alt="Mouse navigation in the menus"></td>
+    <td><img src="https://github.com/user-attachments/assets/f75fb9f0-ac87-4266-b1a8-1d4164917554" width="405" alt="Mouse navigation in the menus"></td>
+  </tr>
+</table>
+
+Menus are now fully usable using mouse and keyboard. Inputs have been rewritten so that when a menu is open it allows you to navigate the menu using your mouse cursor. Every option in every menu and sub-menu is clickable, including adjusting sliders or moving the scrollbar. The navigation is made more natural by making the selected option jump directly where the cursor is, preventing the whole menu from scrolling to where the cursor is located. The mouse's side (thumb) button can also be used to return to the previous menu.
+
+Inputs have also been rewritten for the keyboard. The Select and Back buttons (as well as the Title Menu button) are now using keys that feel more natural, akin to a proper PC game. The game dynamically switches between the menu and in-game control schemes to avoid breaking inputs during gameplay.
+
+### Button prompts
+
+<img width="405" alt="Key and mouse button prompts" src="https://github.com/user-attachments/assets/43e7e740-c536-4bab-ab7e-887cb9246369" />
+
+All the button prompts have been remade using my own vectorized design. The game is able to dynamically create each button using the game's font, the keys are not hardcoded. In addition, the in-game hints will reflect those changes in real time, with some hints rewritten to read more naturally when displaying PC button prompts.
+
+Key bindings can also be changed in game using a new menu under Options > Controls. In the menus, the keyboard and mouse button prompts will cycle from one to another, indicating that navigation is possible with both.
+
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/6da82665-c5c1-4ebd-835e-82c97657a376" width="405" alt="Key bindings menu"></td>
+    <td><img src="https://github.com/user-attachments/assets/224a809b-3750-4c8f-8d94-44bcf5258f2d" width="405" alt="Key bindings menu"></td>
   </tr>
 </table>
 
 ---
 
+## Switching input method and button prompts
+
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/4be239a0-c014-4438-b541-25950585d395" width="405" alt="Switching between keyboard and controller"></td>
+    <td><img src="https://github.com/user-attachments/assets/8e6e1561-1f4c-473c-b3a1-e94b90632e50" width="405" alt="Switching between keyboard and controller"></td>
+  </tr>
+</table>
+
+You can now switch from keyboard and mouse to a controller and back, the game will dynamically switch based on the last input. If you feel like platforming using a controller and then switch to mouse and keyboard for shooting, you can now do that. When switching to another input method, the game will display the correct button prompts.
+
+The Xbox control layout has also been added under Options > Controls > Controller layout.
+
+<img width="405" alt="Xbox controller layout" src="https://github.com/user-attachments/assets/06aafc7c-c400-4c92-91e8-5d10e55b22ec" />
+
+---
+
+## More info
 
 - **Download:** see the [Releases](../../releases) page. Unzip, run `Uncharted.exe`, pick your
   game folder and press PLAY.
+- **Requirements:** same as the original port (see the original README below).
 - **Source:** branch [`u1-mkb-qol`](../../tree/u1-mkb-qol). Licensed under the GPL v2 like the
   original.
 - **No game files are included.** You need your own decrypted dump of the collection.
+- **ONLY TESTED WITH CUSA02320 (US), version 1.02.** I don't know if it works using other dump versions.
 
 The full list of changes and the known problems are in each release's notes.
 
 ---
+
+<details>
+<summary>Original README of SuperMedo's port (requirements, features, credits)</summary>
 
 # Uncharted: The Nathan Drake Collection for Windows
 
