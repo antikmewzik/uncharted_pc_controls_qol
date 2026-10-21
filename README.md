@@ -2,12 +2,33 @@
 > Not affiliated with SuperMedo. Please do not report problems with this fork to him: use the
 > [Issues](../../issues) tab here. The original README follows below.
 
-## About this fork
+---
 
-This fork adds native keyboard, mouse and controller handling to **Uncharted 1** (Uncharted 2
-and 3 are pending): keyboard and mouse in the menus and in game, mouse camera, dynamic button
-prompts for keyboard and mouse, Xbox and PlayStation controllers, live switching between
-devices, and a key rebinding sub-menu in the Controls menu.
+**Is this fork still being worked on?**
+
+YES ✅ (as of 21 Oct 2026)
+
+# Uncharted PC - Controls and user experience QoL changes
+
+This fork aims to transform **Uncharted 1** _(Uncharted 2 and 3 are pending)_ by adding full keyboard and mouse controls in game and in the menus, with dynamic button prompts and instant input method switching.
+
+## Full mouse control
+
+<table>
+  <tr>
+    <td><img src="https://github.com/user-attachments/assets/aac36114-f668-4217-be89-7c7748fd0ff7" width="270" alt="look_mouse"></td>
+    <td><img src="https://github.com/user-attachments/assets/86887212-8b3b-41f2-b909-7d93c83d6b61" width="270" alt="mouse_grenade"></td>
+    <td><img src="https://github.com/user-attachments/assets/d53b034b-da9b-4329-9be1-03469a8091a1" width="270" alt="mouse_gameplay"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Mouse look</em></td>
+    <td align="center"><em>Grenade with the mouse</em></td>
+    <td align="center"><em>Mouse gameplay</em></td>
+  </tr>
+</table>
+
+---
+
 
 - **Download:** see the [Releases](../../releases) page. Unzip, run `Uncharted.exe`, pick your
   game folder and press PLAY.
