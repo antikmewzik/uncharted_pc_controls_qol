@@ -38,6 +38,8 @@ NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
 VERSION = '0.3.6'
+# False: no update check, no Updates section, nothing downloaded (an upstream release would replace this modified build).
+UPDATES_ENABLED = False
 RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
 RELEASES_PAGE = 'https://github.com/Supermedo/uncharted_pc/releases/latest'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'uncharted-update'
@@ -86,20 +88,21 @@ FRAME_GEN_MULTIPLIERS = [('2', '2× (one generated frame)'), ('3', '3× (DLSS on
 # Controls (input.ini, read by the game: src/runtime_pad.c). Actions with their PS4 names, the
 # default keys ("A|B": two bindings) and the default controller buttons (SDL names).
 BUTTON_ACTIONS = [
-    ('cross', 'Cross ✕', 'Space', 'a'), ('circle', 'Circle ○', 'C', 'b'),
+    ('cross', 'Cross ✕', 'Space', 'a'), ('circle', 'Circle ○', 'Left Ctrl', 'b'),
     ('square', 'Square □', 'F', 'x'), ('triangle', 'Triangle △', 'E', 'y'),
-    ('l1', 'L1', 'Q', 'leftshoulder'), ('r1', 'R1', 'G', 'rightshoulder'),
+    ('l1', 'L1', 'G', 'leftshoulder'), ('r1', 'R1', 'R', 'rightshoulder'),
     ('l2', 'L2 (aim)', 'Mouse Right', 'lefttrigger'), ('r2', 'R2 (fire)', 'Mouse Left', 'righttrigger'),
-    ('l3', 'L3', 'Left Shift', 'leftstick'), ('r3', 'R3', 'V', 'rightstick'),
+    ('l3', 'L3', 'Left Shift', 'leftstick'), ('r3', 'R3', 'Mouse Middle', 'rightstick'),
     ('options', 'Options', 'Escape|Return', 'start'), ('touchpad', 'Touchpad', 'Tab', 'back'),
-    ('up', 'D-pad up', 'Up', 'dpup'), ('down', 'D-pad down', 'Down', 'dpdown'),
-    ('left', 'D-pad left', 'Left|Wheel Up', 'dpleft'), ('right', 'D-pad right', 'Right|Wheel Down', 'dpright'),
+    ('up', 'D-pad up', 'V', 'dpup'), ('down', 'D-pad down', 'P', 'dpdown'),
+    ('left', 'Weapon 1 (D-pad left)', '1|Wheel Up', 'dpleft'), ('right', 'Weapon 2 (D-pad right)', '2|Wheel Down', 'dpright'),
 ]
 STICK_ACTIONS = [
     ('ls_up', 'Move forward', 'W'), ('ls_down', 'Move back', 'S'),
     ('ls_left', 'Move left', 'A'), ('ls_right', 'Move right', 'D'),
     ('rs_up', 'Look up', 'I'), ('rs_down', 'Look down', 'K'),
     ('rs_left', 'Look left', 'J'), ('rs_right', 'Look right', 'L'),
+    ('walk', 'Walk (hold with the movement keys)', 'C'),
 ]
 DEFAULT_KEYS = {a: k for a, _t, k, _p in BUTTON_ACTIONS} | {a: k for a, _t, k in STICK_ACTIONS}
 DEFAULT_PAD = {a: p for a, _t, _k, p in BUTTON_ACTIONS}
@@ -138,8 +141,8 @@ APP_DEFAULTS = {'game_dir': '', 'game_dir_u1': '', 'game_dir_u2': '', 'game_dir_
                 'window_size': '1920x1080', 'scaler': 'fsr1', 'sharpening': '500',
                 'anti_aliasing': 'off', 'aa_sharpness': '0.2', 'frame_generation': 'off',
                 'frame_gen_multiplier': '2', 'extra_env': '', 'close_on_play': False,
-                'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_invert_y': False,
-                'pad_invert_y': False, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True}
+                'mouse_look': True, 'mouse_sensitivity': '1.0', 'mouse_aim_sensitivity': '1.0', 'mouse_invert_y': False,
+                'pad_invert_y': False, 'key_icons': True, 'key_bindings': {}, 'pad_bindings': {}, 'check_updates': True}
 
 
 def _(text):
@@ -256,10 +259,10 @@ def game_available(s, key):
     return (Path(folder) / exe).is_file() or bool(own and (Path(folder) / 'eboot.bin').is_file())
 
 
-def mouse_sensitivity(s):
+def mouse_sensitivity(s, key='mouse_sensitivity'):
     """The saved sensitivity as the game reads it: a number in the slider's range."""
     try:
-        return f"{min(MOUSE_SENS_MAX, max(MOUSE_SENS_MIN, float(s.get('mouse_sensitivity')))):.2f}"
+        return f"{min(MOUSE_SENS_MAX, max(MOUSE_SENS_MIN, float(s.get(key)))):.2f}"
     except (TypeError, ValueError):
         return '1.00'
 
@@ -309,6 +312,7 @@ def write_input_ini(s):
     lines = ['# Uncharted controls (written by the launcher, Controls page)',
              f"mouse_look={1 if s.get('mouse_look', True) else 0}",
              f"mouse_sensitivity={mouse_sensitivity(s)}",
+             f"mouse_aim_sensitivity={mouse_sensitivity(s, 'mouse_aim_sensitivity')}",
              f"mouse_invert_y={1 if s.get('mouse_invert_y') else 0}",
              f"pad_invert_y={1 if s.get('pad_invert_y') else 0}"]
     lines += [f'key.{action}={keys.get(action, "")}' for action in DEFAULT_KEYS]
@@ -351,6 +355,7 @@ def game_environment(s, start=None):
     env['BB_FSR_SHARPNESS'] = str(s.get('aa_sharpness') or '0')
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
+    env['BB_KEY_ICONS'] = '1' if s.get('key_icons', True) else '0'
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -402,7 +407,7 @@ class Launcher:
         self.show('play')
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
-        if self.app.get('check_updates', True):
+        if UPDATES_ENABLED and self.app.get('check_updates', True):
             threading.Thread(target=self.check_update, daemon=True).start()
 
     def px(self, size):
@@ -1055,7 +1060,14 @@ class Launcher:
                         COLORS, self.px, self.font_ui_md, width=300, log=True, entry=True),
                  _('How far the camera turns for a mouse movement; 1.00 is the default. Drag the slider or '
                    'type a number (0.1 to 10) for a faster turn.'))
+        self.row(f, _('Aim sensitivity'),
+                 Slider(self.tk, self.target(f), self.var('mouse_aim_sensitivity'), MOUSE_SENS_MIN, MOUSE_SENS_MAX, 0.05,
+                        COLORS, self.px, self.font_ui_md, width=300, log=True, entry=True),
+                 _('Multiplies the mouse sensitivity while aiming (right button held); 1.00 turns as fast as free look.'))
         self.check(f, 'mouse_invert_y', _('Invert the mouse vertically'))
+        self.check(f, 'key_icons', _('Show keyboard and mouse keys in the prompts'),
+                   _('Uncharted 1: the buttons of the prompts (Press ✕, ▲, L1...) become the keys and mouse buttons '
+                     'set below. Turn it off to see the controller buttons.'))
 
         self.section(f, _('Keyboard and mouse buttons'))
         self.note(f, _('Click a box, then press a key or a mouse button (the wheel counts too). '
@@ -1224,6 +1236,14 @@ class Launcher:
         self.pill(holder, _('Open the saves folder'),
                   lambda: self.open_path(self.var('user_dir').get(), 'user_dir')).pack(side='left', padx=(8, 0))
         self.section(f, _('Updates'))
+        if not UPDATES_ENABLED:
+            self.note(f, _('Updates are not supported in this version. Visit the original GitHub page to get the '
+                           'latest version (it may not be compatible with this version).'), top=2)
+            card = self.target(f)
+            holder = self.tk.Frame(card, bg=CARD)
+            holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
+            self.pill(holder, _('Original GitHub page'), lambda: webbrowser.open(RELEASES_PAGE)).pack(side='left')
+            return
         self.check(f, 'check_updates', _('Look for a new version when the launcher starts'))
         card = self.target(f)
         holder = self.tk.Frame(card, bg=CARD)
@@ -1416,6 +1436,8 @@ class Launcher:
     # ---- updates -------------------------------------------------------------------------------
     def check_update(self, manual=False):
         """Helper thread: asks GitHub for the newest release and offers it when it is newer."""
+        if not UPDATES_ENABLED:
+            return
         try:
             version, url, page = latest_release()
         except (OSError, ValueError, KeyError) as failure:
@@ -1453,6 +1475,8 @@ class Launcher:
             self.status.configure(text=text, fg=GOLD)
 
     def install_update(self, version, url, page):
+        if not UPDATES_ENABLED:
+            return
         if self.process:
             self.messagebox.showinfo(NAME, _('Close the game before updating.'))
             return
@@ -1669,7 +1693,7 @@ def main():
     args = sys.argv[1:]
     if args and args[0] in ('--run', '--script'):
         sys.exit(run_role(args))
-    if args[:1] == ['--install-update'] and len(args) == 3:
+    if UPDATES_ENABLED and args[:1] == ['--install-update'] and len(args) == 3:
         sys.exit(install_update(args[1], args[2]))
     if FROZEN and UPDATE_DIR not in PORT_DIR.parents:
         shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # what a finished update left behind
