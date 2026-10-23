@@ -616,6 +616,7 @@ static void u2_zoom_camera(uint64_t camera, uint64_t image) {
     u2_native_us=now_us();
     if (step==0.0f && step_pitch==0.0f) return;
     float *d=(float *)(uintptr_t)(camera+0x1f30);
+    if (!(d[0]>-1.5f && d[0]<1.5f && d[1]>-1.5f && d[1]<1.5f && d[2]>-1.5f && d[2]<1.5f)) return; /* a new camera: not set yet */
     if (step!=0.0f) {
         const float a=step*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
         const float x=d[0], z=d[2];
@@ -661,7 +662,39 @@ static void __attribute__((ms_abi)) u2b_camera_hook(uint64_t unused0, uint64_t u
     case U2B_UPDATE_COVER: u2_cover_camera(camera,image); break;
     case U2B_UPDATE_LOOK: u2_look_camera(camera,image); break;
     case U2B_UPDATE_FOLLOW: /* walking: the follow camera's direction (+0x9ec0) and vertical arc (+0x9e60), as in the earlier U2 build */
-        follow_camera(camera,0x9ec0,0x9e60,135.0f,!(u2_frame_dt(image)>0.0f));
+    {
+        /* A walking camera that has just been made (museum start, chapter or level change) holds numbers that are not set yet
+         * (NaN, huge): writing the position from them made the game stop on IsFinite(m_smoothedCameraPos) / the camera
+         * translation limit. So the camera is left alone for its first frames and while any of its numbers is unusable. */
+        static uint64_t seen_camera; static unsigned seen_frames;
+        const uint64_t t_now=now_us();
+        static uint64_t seen_us;
+        if (camera!=seen_camera || t_now-seen_us>100000) { seen_camera=camera; seen_frames=0; }
+        seen_us=t_now;
+        if (seen_frames<8) ++seen_frames;
+        const float *chk_dir=(const float *)(uintptr_t)(camera+0x9ec0), *chk_pos=(const float *)(uintptr_t)(camera+0x9d70);
+        const float *chk_pivot=(const float *)(uintptr_t)(camera+0x9e70), *chk_t1=(const float *)(uintptr_t)(camera+0x9d50);
+        const float *chk_t0=(const float *)(uintptr_t)(camera+0x9eb0);
+        int usable=seen_frames>=8;
+        for (int i=0;usable && i<3;++i) {
+            if (!(chk_dir[i]>-2.0f && chk_dir[i]<2.0f) || !(chk_pos[i]>-5000.0f && chk_pos[i]<5000.0f) ||
+                !(chk_pivot[i]>-5000.0f && chk_pivot[i]<5000.0f) || !(chk_t1[i]>-5000.0f && chk_t1[i]<5000.0f) ||
+                !(chk_t0[i]>-5000.0f && chk_t0[i]<5000.0f)) usable=0;
+        }
+        if (usable) {
+            const float gx=chk_pos[0]-chk_pivot[0], gy=chk_pos[1]-chk_pivot[1], gz=chk_pos[2]-chk_pivot[2];
+            if (!(gx*gx+gy*gy+gz*gz<400.0f*400.0f)) usable=0;
+        }
+        if (!usable) {
+            float ignore_x, ignore_y;
+            camera_take(0,&ignore_x,&ignore_y);
+            follow_applied=0.0f; follow_arc_moved=0;
+            if (mouse_debug()) { static unsigned skipped; if ((skipped++&63)==0) printf("Mouse: u2 follow camera %#llx skipped (frames=%u)\n",(unsigned long long)camera,seen_frames); }
+            break;
+        }
+    }
+        { const float frame_dt=u2_frame_dt(image);
+          follow_camera(camera,0x9ec0,0x9e60,135.0f,!(frame_dt>0.0f && frame_dt<0.25f)); }
         if ((follow_applied!=0.0f || follow_arc_moved) && !input.free_view_smoothing) {
             /* The camera's target position (+0x9d50, the one before it at +0x9eb0) follows the direction at once, on a circle about
              * the player (+0x9e70), but the position it shows (+0x9d70) follows that target through a spring and trails it by 6 to
@@ -691,7 +724,9 @@ static void __attribute__((ms_abi)) u2b_camera_hook(uint64_t unused0, uint64_t u
                 px=x*c-pz*s;
                 pz=x*s+pz*c;
             }
-            pos[0]=pivot[0]+px; pos[1]=pivot[1]+py; pos[2]=pivot[2]+pz;
+            if (px>-400.0f && px<400.0f && py>-400.0f && py<400.0f && pz>-400.0f && pz<400.0f) { /* false for NaN too */
+                pos[0]=pivot[0]+px; pos[1]=pivot[1]+py; pos[2]=pivot[2]+pz;
+            }
         }
         if (mouse_debug()) {
             static unsigned n;
@@ -1326,6 +1361,19 @@ static int menu_mode, menu_guard;   /* defined with the menu keys below */
 #define FREE_TEXTS 160
 static MenuText free_texts[FREE_TEXTS];
 static int free_text_count;
+/* The credits (U1 1.02): the credits task updates and draws itself in image+0x3b41e0 (strings "CREDITS:: ..." and "credits-roll"), called every
+ * frame while they are on screen; they draw no menu text the port sees, so the menu keys and the mouse would otherwise be off there. */
+static volatile uint64_t u1_credits_us;
+static int u1_credits_recent(uint64_t now) { return u1_credits_us && now-u1_credits_us<300000 && u1_credits_us<=now+1000000; }
+static void __attribute__((ms_abi)) u1_credits_tick(uint64_t task, uint64_t unused1, uint64_t image, uint64_t r14) {   /* task = rdi: its first word is the state, 7..11 while the credits roll */
+    (void)unused1; (void)image; (void)r14;
+    uint32_t state=0;
+    static uint32_t last_state=0xffffffffu;
+    if (!safe_read(&state,task,4)) return;
+    if (mouse_debug() && state!=last_state) { last_state=state; printf("Runtime: U1 credits task state %u\n",state); }
+    if (state-7u<5u) u1_credits_us=now_us();
+}
+static const unsigned char u1_credits_code[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x98,0x01,0x00,0x00};
 static void __attribute__((ms_abi)) u1_text_draw(uint64_t unused0, uint64_t unused1, uint64_t image, uint64_t r14) {
     (void)unused0; (void)unused1; (void)image; (void)r14;
     const uint64_t item=menu_text_item;
@@ -1746,6 +1794,18 @@ static void __attribute__((ms_abi)) u1_compare_prompt(uint64_t unused0, uint64_t
     (void)unused0; (void)unused1; (void)image; (void)r14;
     u1_compare_us=now_us();
 }
+/* U1 1.02: the same function (the prompt bar, 0x128c70, flags in r9d = param_7) draws the "SÉLECTIONNER" prompt when bit 0 of the flags is
+ * set. In Statistiques that prompt has nothing to do on a statistic (a click does nothing there, see menu_mouse_buttons): the hook at the
+ * start of the function clears the bit in the saved r9 (restored by the thunk) while u1_hide_select_us is recent. */
+static volatile uint64_t u1_hide_select_us;
+static void __attribute__((ms_abi)) u1_bar_flags(uint64_t unused0, uint64_t unused1, uint64_t image, uint64_t r14) {
+    (void)unused0; (void)unused1; (void)image; (void)r14;
+    if (now_us()-u1_hide_select_us>=150000) return;
+    uint64_t r9=saved_register(6);
+    r9&=~(uint64_t)1;
+    safe_write(guest_callback_rsp-8u*6u,&r9,8);
+}
+static const unsigned char u1_bar_flags_code[]={0x45,0x89,0xcf,0x44,0x89,0xbd,0xa8,0xfd,0xff,0xff};   /* mov r15d, r9d; mov [rbp-0x258], r15d */
 static const unsigned char u1_compare_code[]={0x41,0x83,0x7d,0x48,0x00,0x0f,0x84};
 static const unsigned char u1_compare_je_code[]={0x0f,0x84,0x34,0x02,0x00,0x00};
 static const unsigned char u1_compare_je_patch[]={0x0f,0x84,0xf8,0x02,0x00,0x00};   /* to 0x129267, past the prompt */
@@ -2298,6 +2358,8 @@ static const RuntimeGuestCallback guest_callbacks[]={
     {"U1 compare-with-friends prompt (skip 1)",0x128f69,u1_compare_je_code,sizeof(u1_compare_je_code),sizeof(u1_compare_je_patch),NULL,u1_compare_je_patch},
     {"U1 compare-with-friends prompt (skip 2)",0x128f76,u1_compare_jmp_code,sizeof(u1_compare_jmp_code),sizeof(u1_compare_jmp_patch),NULL,u1_compare_jmp_patch},
     {"U1 menu add item",0x132f00,u1_menu_add_item_code,sizeof(u1_menu_add_item_code),6,u1_menu_add_item,NULL},
+    {"U1 prompt bar flags",0x128c8a,u1_bar_flags_code,sizeof(u1_bar_flags_code),10,u1_bar_flags,NULL},
+    {"U1 credits tick",0x3b41e0,u1_credits_code,sizeof(u1_credits_code),6,u1_credits_tick,NULL},
     {"U1 menu text draw",0x13acf0,u1_text_draw_code,sizeof(u1_text_draw_code),6,u1_text_draw,NULL},
     {"U1 menu item draw (1)",0x133fbc,u1_menu_item_begin_code,sizeof(u1_menu_item_begin_code),9,u1_menu_item_begin,NULL},
     {"U1 menu item draw end (1)",0x133fc8,u1_menu_item_end1_code,sizeof(u1_menu_item_end1_code),7,u1_menu_item_end,NULL},
@@ -2708,6 +2770,7 @@ static int menu_mode, menu_guard;
  * follow camera of the play runs again, or the pause was left with Alt or Esc (resume). "Back to the main
  * menu" and the title screen after it are then in menu mode; resuming in a game section without the follow
  * camera (vehicles) leaves it at once through Alt/Esc. */
+static int u2_menu_on, u2_menu_key_guard;   /* defined with the U2 menus below; the guard keeps the four buttons released at a change until their keys are */
 static int menu_exit_key;             /* 1: the last menu key pressed was Alt or Esc (resume), 0: Enter */
 /* Play sections with a fixed camera (the German submarine) never run the follow camera: after a skipped cutscene the menu
  * keys would stay on for ever. 1: forced off because the clock runs and no menu item text has been drawn for a while;
@@ -2715,6 +2778,7 @@ static int menu_exit_key;             /* 1: the last menu key pressed was Alt or
 static int menu_idle_off;
 static int menu_open(void) {
     if (!u1_image) return 0;
+    if (u1_credits_recent(now_us())) return 1;   /* (the credits have no menu item: the keys and the mouse must be on for the way back) */
     if (u1_camera_dt_offset && camera_stopped(u1_image,u1_camera_dt_offset)) return 1;
     if (menu_idle_off==2) return 1;
     if (menu_idle_off==1) return 0;
@@ -2761,6 +2825,21 @@ static int menu_key_action_down(int a, const bool *k) {
 static int key_action_down(int a, const bool *k, uint32_t mouse, uint64_t now) {
     const int menu_button=a==A_CROSS || a==A_CIRCLE || a==A_TRIANGLE || a==A_R1 || a==A_OPTIONS;
     if (menu_button && menu_guard) return 0;
+    static int u2_keys_off=-1;   /* BB_U2_MENU_KEYS=0: the menus of U2 keep the keys of the play (diagnosis) */
+    if (u2_keys_off<0) { const char *e=getenv("BB_U2_MENU_KEYS"); u2_keys_off=e && atoi(e)==0; }
+    if (!menu_mode && !u1_image && !u2_keys_off) {   /* U2: the menus have the keys of the U1 menus (Enter, Esc, Alt, Backspace), the same ones the pastilles show */
+        if (u2_menu_key_guard && !menu_keys_held(k)) u2_menu_key_guard=0;
+        if (menu_button && u2_menu_key_guard) return 0;
+        if (u2_menu_on && menu_button) {
+            switch (a) {
+            case A_CROSS: return k && (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER]);
+            case A_CIRCLE: return k && k[SDL_SCANCODE_ESCAPE];
+            case A_OPTIONS: return k && (k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT]);
+            case A_R1: return k && k[SDL_SCANCODE_BACKSPACE];
+            default: return 0;
+            }
+        }
+    }
     if (!menu_mode) return action_down(a,k,mouse,now);
     /* The mouse in a menu: the wheel moves up and down (d-pad), the lower thumb button (Mouse 4, "back") goes
      * back (circle). The left click will validate (cross) once the cursor can select the text under it: not
@@ -2772,7 +2851,7 @@ static int key_action_down(int a, const bool *k, uint32_t mouse, uint64_t now) {
         if (a==A_UP && now<wheel_until_us[0]) return 1;
         if (a==A_DOWN && now<wheel_until_us[1]) return 1;
     }
-    if (a==A_CIRCLE && (mouse & 8u)) return 1;
+    if (a==A_CIRCLE && ((mouse & 8u) || ((mouse & 2u) && u1_credits_recent(now)))) return 1;   /* (the credits have nothing to click: the right button goes back) */
     if (menu_button) {
         if (menu_key_action_down(a,k)) return 1;
         /* No menu text while the menu keys are on, but a button icon on screen (a hint): a scripted scene with its own prompt
@@ -2844,7 +2923,7 @@ static void menu_update(const bool *k, uint32_t mouse) {
         static uint64_t on_since;
         const uint64_t t=now_us();
         if (!menu_mode) on_since=0; else if (!on_since) on_since=t;
-        const int idle=menu_mode && t-on_since>1000000 && !menu_texts_recent(t);
+        const int idle=menu_mode && t-on_since>1000000 && !menu_texts_recent(t) && !u1_credits_recent(t);   /* (the credits draw no menu text, yet they are no cutscene: Esc goes back there) */
         if (idle!=menu_no_text) { menu_no_text=idle; bbgpu_menu_cursor_hidden(idle); printf("Runtime: menu no text (cutscene) %s\n",idle ? "yes" : "no"); }
         const int esc=k && k[SDL_SCANCODE_ESCAPE];
         if (!esc) menu_esc_latch=0; else if (menu_no_text) menu_esc_latch=1;
@@ -2863,6 +2942,7 @@ static void menu_update(const bool *k, uint32_t mouse) {
             for (int i=0;i<menu_text_count && !texts;++i) if (t-menu_texts[i].us<300000) texts=1;
             pthread_mutex_unlock(&menu_text_lock);
         }
+        if (u1_credits_recent(t)) texts=1;
         if (stopped || follow) { quiet_since=busy_since=0; menu_idle_off=0; }
         else if (!texts) {
             busy_since=0; if (!quiet_since) quiet_since=t;
@@ -3149,7 +3229,7 @@ static uint32_t menu_mouse_buttons(const bool *k, uint32_t mouse, uint64_t now) 
     /* A scrolling list: the cursor over its rows moves the highlight there (up or down presses until the highlighted row
      * is at the cursor), a click then validates. */
     ListInfo list={0};
-    int list_ctl=0, list_delta=0;
+    int list_ctl=0, list_delta=0, list_title=0, list_noclick=0;
     int list_found=menu_list_find_ex(now,&list,0);
     if (list_found && list.sel_cy<0.0f) {   /* the highlighted row is out of view (scrolled away with the bar): where it would be */
         const int top=list_top_read(list.item), idx=menu_list_index(list.item);
@@ -3158,6 +3238,46 @@ static uint32_t menu_mouse_buttons(const bool *k, uint32_t mouse, uint64_t now) 
     if (list_found && ux>=list.colx-20.0f && ux<=list.colx+560.0f && uy>=list.top-4.0f && uy<=list.bottom+4.0f) {
         list_ctl=1;
         list_delta=(int)floorf((uy-list.sel_cy)/list.pitch+0.5f);
+        /* Statistiques (a list with a column of values on the right): only the difficulties of Contre-la-montre (rows with an empty value) open
+         * something. A click on a statistic does nothing, and the section titles (dimmer: style[1] 0.5) are never selected by the game, so
+         * the cursor over one must not chase it (the highlight shook between the rows around it). */
+        int stats=0, label=-1, value_w=0;
+        pthread_mutex_lock(&menu_text_lock);
+        for (int i=0;i<menu_text_count;++i) {
+            const MenuText *t=&menu_texts[i];
+            if (t->item!=list.item || now-t->us>100000 || t->ordinal<1) continue;
+            if (t->x>list.colx+300.0f && t->w>0.5f && t->h<30.0f) stats=1;
+            if (fabsf(t->x-list.colx)<1.0f && t->h>=22.0f && t->h<=29.0f && uy>=t->y-2.0f && uy<t->y+list.pitch-2.0f) label=i;
+        }
+        if (label>=0) {
+            const MenuText *l=&menu_texts[label];
+            for (int i=0;i<menu_text_count;++i) {
+                const MenuText *t=&menu_texts[i];
+                if (t->item==list.item && now-t->us<=100000 && t->ordinal>=1 && t->x>list.colx+300.0f && t->h<30.0f && fabsf(t->y-l->y)<2.0f && t->w>0.5f) value_w=1;
+            }
+            if (stats) {
+                if (l->style[1]<0.7f && l->style[5]<2.5f) { list_title=1; list_noclick=1; list_delta=0; }
+                else if (value_w) list_noclick=1;
+            }
+        }
+        pthread_mutex_unlock(&menu_text_lock);
+    }
+    if (list_found) {   /* Statistiques, highlight on a statistic (a row with a value): no "SÉLECTIONNER" in the prompt bar, see u1_bar_flags */
+        int stats=0, sel_value=0;
+        pthread_mutex_lock(&menu_text_lock);
+        const MenuText *sl=NULL;
+        for (int i=0;i<menu_text_count;++i) {
+            const MenuText *t=&menu_texts[i];
+            if (t->item!=list.item || now-t->us>100000 || t->ordinal<1) continue;
+            if (t->x>list.colx+300.0f && t->w>0.5f && t->h<30.0f) stats=1;
+            if (fabsf(t->x-list.colx)<1.0f && t->h>=22.0f && t->h<=29.0f && t->style[5]>2.5f) sl=t;
+        }
+        if (sl) for (int i=0;i<menu_text_count;++i) {
+            const MenuText *t=&menu_texts[i];
+            if (t->item==list.item && now-t->us<=100000 && t->ordinal>=1 && t->x>list.colx+300.0f && t->h<30.0f && fabsf(t->y-sl->y)<2.0f && t->w>0.5f) sel_value=1;
+        }
+        pthread_mutex_unlock(&menu_text_lock);
+        if (stats && sel_value) u1_hide_select_us=now;
     }
     uint64_t menu=0; int index=-1, count=0;
     const int on_row=list_ctl ? 0 : menu_row_at(ux,uy,now,&menu,&index,&count);
@@ -3168,7 +3288,8 @@ static uint32_t menu_mouse_buttons(const bool *k, uint32_t mouse, uint64_t now) 
         if (moved) { h.list_active=1; h.list_presses=0; }
         if (now<wheel_until_us[0] || now<wheel_until_us[1] ||
             (k && (k[SDL_SCANCODE_W] || k[SDL_SCANCODE_S] || k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_DOWN]))) h.list_active=0;
-        if (clicked) { h.list_click=1; h.list_deadline=now+1500000; h.list_active=1; h.list_presses=0; }
+        if (clicked && !list_noclick) { h.list_click=1; h.list_deadline=now+1500000; h.list_active=1; h.list_presses=0; }
+        if (list_title) h.list_active=0;
     } else h.list_click=0;
     /* Hovering a row at the edge of a list must not scroll it: the first row shown is noted when the cursor starts to move the
      * highlight, and put back whenever the game moves it meanwhile (until a moment after the highlight is under the cursor, or the
@@ -3287,6 +3408,12 @@ static uint32_t menu_mouse_buttons(const bool *k, uint32_t mouse, uint64_t now) 
     }    if (h.queue!=0 && now>=h.step_until && now>=h.next_step) {
         h.step_dir=h.queue>0 ? 2 : 1;
         h.step_until=now+35000; h.next_step=now+70000;
+        const int n=h.queue>0 ? h.queue : -h.queue;
+        if (h.drag && n>1 && h.menu && !u1_jump_steps && !u1_jump_busy) {   /* a slider far from the cursor: one real press (event 3 left, 4 right) carries the other steps, see u1_menu_event */
+            u1_jump_menu=h.menu; u1_jump_type=h.queue>0 ? 4 : 3; u1_jump_us=now; u1_jump_steps=n-1;
+            h.queue=h.queue>0 ? 1 : -1;
+            h.next_step=now+45000;
+        }
         h.queue+=h.queue>0 ? -1 : 1;
     }
     if (now<h.step_until) out|=h.step_dir==1 ? BTN_LEFT : BTN_RIGHT;
@@ -3374,7 +3501,7 @@ static int u2_menu_active(uint64_t now) {
     const int carousel=u2_popup_us && now-u2_popup_us<700000 && u2_popup_us<=now+1000000;   /* (the carousel has no row to highlight either) */
     if (hi || layout || credits || carousel) seen=now;
     const int on=seen && now-seen<300000;
-    if (on!=u2_menu_on) { u2_menu_on=on; u2_menu_reset=on; bbgpu_game_menu_cursor(on); printf("Runtime: U2 menu mouse %s\n",on ? "on" : "off"); }
+    if (on!=u2_menu_on) { u2_menu_on=on; u2_menu_reset=on; u2_menu_key_guard=1; bbgpu_menu_state(on); printf("Runtime: U2 menu mouse %s\n",on ? "on" : "off"); }
     return on;
 }
 /* ---- U2 sliders set by position ---------------------------------------------------------------
@@ -3767,6 +3894,7 @@ static uint32_t u2_menu_buttons(const bool *k, uint32_t mouse, uint64_t now) {
         }
         pthread_mutex_unlock(&menu_text_lock);
     }
+    if (clicked && mouse_debug()) printf("Runtime: U2 click dbg: ux %.0f uy %.0f hov %d [x%.0f y%.0f w%.0f h%.1f s%.1f] sel %d cy %.1f dlg %d slid %d arrow %d popup %d model %d ls %d\n",ux,uy,have_hov,hov.x,hov.y,hov.w,hov.h,hov.s5,have_sel,sel.y+sel.h*0.5f,dlg,have_slid,arrow,popup,in_model,ls_q);
     if (arrow) {
         h.choice=arrow; h.choice_cy=arrow_cy; h.choice_until=now+1500000; h.choice_seen=0;
         h.active=1; h.presses=0; h.budget=0; h.stuck=0; h.last_dir=-1; h.click=0;

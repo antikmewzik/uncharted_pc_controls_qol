@@ -695,9 +695,14 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     unsigned char *thunks=NULL;
     size_t used=0;
     guest_image_size=image_size;
+    int is_u1=0;   /* the image is Uncharted 1's when one of the U1 hooks matches: the U2 list widget hook (8 bytes of prologue) also matches a function of U1 and must not go there */
+    for (size_t i=0;i<count && !is_u1;++i) {
+        const RuntimeGuestCallback *c=&callbacks[i];
+        if (!strncmp(c->name,"U1 ",3) && mapped(segments,ns,c->offset,c->signature_size) && !memcmp(image+c->offset,c->signature,c->signature_size)) is_u1=1;
+    }
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
-        if (getenv("BB_SKIP_U2_WIDGET") && strstr(c->name,"U2 list widget")) continue;   /* diagnosis: this hook also matches a function of U1 */
+        if ((is_u1 || getenv("BB_SKIP_U2_WIDGET")) && strstr(c->name,"U2 list widget")) continue;
         if (!mapped(segments,ns,c->offset,c->signature_size) ||
             memcmp(image+c->offset,c->signature,c->signature_size)) continue;
         if (!c->callback) {
@@ -705,8 +710,8 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,c->offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(4096))) { printf("Callbacks: no thunk memory\n"); return; }
-        if (used+256>4096) break;
+        if (!thunks && !(thunks=near_image_memory(16384))) { printf("Callbacks: no thunk memory\n"); return; }
+        if (used+256>16384) break;
         unsigned char *t=thunks+used, *f=image+c->offset;
         size_t k=0;
         /* pushfq; push rax rcx rdx r8-r11 rbx; mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at
