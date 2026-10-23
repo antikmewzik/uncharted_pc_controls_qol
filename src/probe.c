@@ -725,7 +725,6 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     unsigned char *thunks=NULL;
     size_t used=0;
     uint8_t installed[32]={0};
-    uint64_t hook_offsets[32]; size_t hooks_done=0;
     guest_image_size=image_size;
     int is_u1=0;   /* the image is Uncharted 1's when one of the U1 hooks matches: the U2 list widget hook (8 bytes of prologue) also matches a function of U1 and must not go there */
     for (size_t i=0;i<count && !is_u1;++i) {
@@ -738,9 +737,9 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         if (!mapped(segments,ns,c->offset,c->signature_size) ||
             memcmp(image+c->offset,c->signature,c->signature_size)) continue;
         if (!c->callback) {
-            memcpy(image+offset,c->patch,c->moved);
+            memcpy(image+c->offset,c->patch,c->moved);
             installed[i]=1;
-            printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,offset);
+            printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,c->offset);
             continue;
         }
         if (!thunks && !(thunks=near_image_memory(16384))) { printf("Callbacks: no thunk memory\n"); return; }
@@ -787,7 +786,7 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,c->moved-5);
         used+=(k+15)&~(size_t)15;
         installed[i]=1;
-        printf("Callbacks: %s at %#" PRIx64 "\n",c->name,offset);
+        printf("Callbacks: %s at %#" PRIx64 "\n",c->name,c->offset);
     }
     /* Names start with the game ("U2 ..."): a callback missing from a game whose other callbacks
      * attached is reported; callbacks of the other games are not. */
