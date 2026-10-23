@@ -60,6 +60,7 @@ int bbgpu_controls_changed(void);
 /* Heading (degrees, about the vertical axis) of the camera the game last rendered with and how old
  * it is; 0 before the first frame with a known camera. */
 int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds);
+void bbgpu_menu_drag(int on);   /* a menu's 3D model is being turned: the motion of the free cursor is sampled too (bbgpu_mouse_sample) */
 int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
