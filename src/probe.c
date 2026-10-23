@@ -704,8 +704,8 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,c->offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(4096))) { printf("Callbacks: no thunk memory\n"); return; }
-        if (used+256>4096) break;
+        if (!thunks && !(thunks=near_image_memory(16384))) { printf("Callbacks: no thunk memory\n"); return; }
+        if (used+256>16384) break;
         unsigned char *t=thunks+used, *f=image+c->offset;
         size_t k=0;
         /* pushfq; push rax rcx rdx r8-r11 rbx; mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at
