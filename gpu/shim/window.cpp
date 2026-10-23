@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <cstring>
+#include <string>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -242,6 +243,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    SetWindowIcon(window);
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
@@ -369,6 +371,10 @@ bool WindowSDL::PollEvents() {
             }
             UpdateTextTitle();
             continue;
+        }
+        // BB_TEXTURE_DUMP=1: F10 saves the textures of the next frame (user/texture_dump).
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat) {
+            Vulkan::FrameCapture::ArmTextureDump();
         }
         // The controller finishes the text dialog too: Cross (A) accepts, Circle (B) cancels.
         if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
