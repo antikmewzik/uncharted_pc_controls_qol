@@ -113,5 +113,7 @@ typedef struct {
     void (__attribute__((ms_abi)) *callback)(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14);
     const unsigned char *patch;
 } RuntimeGuestCallback;
+/* 1 once a callback of the U3 image has been installed (the menus' markup differs from U2's: see runtime_pad.c) */
+extern volatile int runtime_u3_game;
 const RuntimeGuestCallback *runtime_guest_callbacks(size_t *count);
 #endif
