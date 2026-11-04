@@ -3934,11 +3934,20 @@ static void u3_look_layer(uint64_t r14, uint64_t image) {
     if (mouse_debug()) { static unsigned n; if ((n++&15)==0) printf("Mouse: U3 V view turn yaw=%.2f pitch=%.2f w=%.3f pivot=(%.2f %.2f %.2f)\n",(double)total_yaw,(double)total_pitch,(double)w,(double)pivot[0],(double)pivot[1],(double)pivot[2]); }
     u3_turn_pose(p,pivot,total_yaw,total_pitch);
 }
+/* (diagnostic, BB_MOUSE_DEBUG=1) why the cover layer let the picture go untouched this frame; one line per reason per 100 ms */
+static void u3_cover_skip(int why, float a, float b) {
+    static uint64_t last[16];
+    if (!mouse_debug() || why<0 || why>=16) return;
+    const uint64_t t=now_us();
+    if (last[why] && t-last[why]<100000) return;
+    last[why]=t;
+    printf("Mouse: U3 cover SKIP why=%d a=%.4f b=%.4f T=%.4f\n",why,(double)a,(double)b,t*1e-6);
+}
 static void u3_cover_layer(uint64_t r14) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
     const uint64_t now=now_us();
-    if (disabled || pad_only_mode || !(u3_cover_seen_us && now-u3_cover_seen_us<100000)) return;
+    if (disabled || pad_only_mode || !(u3_cover_seen_us && now-u3_cover_seen_us<100000)) { u3_cover_skip(0,u3_cover_seen_us ? (float)((now-u3_cover_seen_us)*1e-3) : -1.0f,0.0f); return; }
     static uint64_t last_us, frame_us;
     static uint64_t handoff_for;
     /* After an aim in this cover the picture is kept ABSOLUTE (abs_h/abs_e, degrees): the game goes on turning Drake, and with him the cover camera's own
@@ -3951,11 +3960,11 @@ static void u3_cover_layer(uint64_t r14) {
         return;
     }
     const float w=*(const float *)(uintptr_t)(r14+0x108);
-    if (!(w>0.0005f && w<=1.0001f)) return;
+    if (!(w>0.0005f && w<=1.0001f)) { u3_cover_skip(1,w,0.0f); return; }
     float cp[3], cq[4];
-    if (!safe_read(cp,r14+0x120,12) || !safe_read(cq,r14+0x130,16)) return;
+    if (!safe_read(cp,r14+0x120,12) || !safe_read(cq,r14+0x130,16)) { u3_cover_skip(2,0.0f,0.0f); return; }
     const float cl=cq[0]*cq[0]+cq[1]*cq[1]+cq[2]*cq[2]+cq[3]*cq[3];
-    if (!(cl>0.98f && cl<1.02f && cp[0]>-100000.0f && cp[0]<100000.0f && cp[1]>-100000.0f && cp[1]<100000.0f && cp[2]>-100000.0f && cp[2]<100000.0f)) return;
+    if (!(cl>0.98f && cl<1.02f && cp[0]>-100000.0f && cp[0]<100000.0f && cp[1]>-100000.0f && cp[1]<100000.0f && cp[2]>-100000.0f && cp[2]<100000.0f)) { u3_cover_skip(3,cl,cp[0]); return; }
     if (now-last_us>300000 && !aim_window) {   /* a new cover: the turn starts again, what the mouse did meanwhile (it turned the walking camera) is dropped */
         float ix, iy;
         camera_take(0,&ix,&iy);   /* (queue 2 is only fed during an aim; 0 is fed while u2_native_us is recent, which is set below) */
@@ -3985,9 +3994,9 @@ static void u3_cover_layer(uint64_t r14) {
     }
     const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
     float *p=(float *)(uintptr_t)g->rax;
-    if ((uintptr_t)p<0x10000) return;
+    if ((uintptr_t)p<0x10000) { u3_cover_skip(4,0.0f,0.0f); return; }
     const float len2=p[4]*p[4]+p[5]*p[5]+p[6]*p[6]+p[7]*p[7];
-    if (!(len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f)) return;
+    if (!(len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f)) { u3_cover_skip(5,len2,p[0]); return; }
     const float look[3]={0.0f,0.0f,1.0f}, back[3]={0.0f,0.0f,-3.0f};
     float f[3], arm[3], pivot[3];
     quat_rotate(cq,back,arm);
@@ -4220,6 +4229,50 @@ static void u3_anim_walk_layer(uint64_t r14) {
     u3_anim_a_yaw=u3_anim_total_yaw; u3_anim_a_pitch=u3_anim_total_pitch;
     { const float fw[3]={0.0f,0.0f,1.0f}; float f[3]; quat_rotate(p+4,fw,f); u3_anim_h=SDL_atan2f(f[0],f[2])*57.29578f; }
 }
+/* Some covers (measured 2026-11-04, entering one: stack [walk, cover(w 0->1), scripted 0x16b6060(w 0->1 in ~1 s)]) hand the picture to a SCRIPTED camera (class
+ * +0x16b6060) that fades in over the cover camera and then stands alone: the mouse's turn, carried by the cover layer alone, was blended away (lerp to the raw
+ * scripted pose) and nothing took it for ~3 s. Here the scripted layer, while it follows a cover, gives back the part of the turn it blends away (yaw*w while the
+ * cover layer turned this frame, the whole turn once the cover camera is gone) and takes the mouse itself when the cover layer no longer does.
+ * Returns 1 when the layer was handled. BB_U3_COVERSCRIPT=0 switches it off. */
+static int u3_cover_script_layer(uint64_t r14) {
+    static int off=-1;
+    if (off<0) { const char *e=getenv("BB_U3_COVERSCRIPT"); off=e && atoi(e)==0; }
+    static int disabled=-1;
+    if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
+    if (off || disabled || pad_only_mode) return 0;
+    uint64_t vt=0;
+    if (!safe_read(&vt,r14,8) || vt!=runtime_image_base()+0x16b6060) return 0;
+    const uint64_t now=now_us();
+    static uint64_t last_us, frame_us; static int active;
+    if (active && now-last_us>300000) active=0;   /* the layer was gone: a new spell */
+    if (!active) {
+        if (!(u3_cover_seen_us && now-u3_cover_seen_us<2000000 && u3_cover_pivot_ok)) return 0;
+        active=1;
+    }
+    last_us=now;
+    const float w=*(const float *)(uintptr_t)(r14+0x108);
+    if (!(w>0.0005f && w<=1.0001f)) return 1;
+    const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    float *p=(float *)(uintptr_t)g->rax;
+    if ((uintptr_t)p<0x10000) return 1;
+    const float len2=p[4]*p[4]+p[5]*p[5]+p[6]*p[6]+p[7]*p[7];
+    if (!(len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f)) return 1;
+    const int cover_now=u3_cover_show_us && now>=u3_cover_show_us && now-u3_cover_show_us<8000;   /* (the cover layer, called before this one, turned the picture this frame) */
+    u2_native_us=now;
+    if (!cover_now && !(frame_us && now-frame_us<1500)) {
+        float dx, dy;
+        camera_take(0,&dx,&dy);
+        u3_cover_yaw+=dx*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity;
+        u3_cover_pitch+=(input.mouse_invert_y ? -dy : dy)*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity;
+        if (u3_cover_pitch>60.0f) u3_cover_pitch=60.0f;
+        if (u3_cover_pitch<-60.0f) u3_cover_pitch=-60.0f;
+        frame_us=now;
+    }
+    const float k=cover_now ? w : 1.0f;
+    if (mouse_debug()) { static unsigned n; if ((n++%6)==0) printf("Mouse: U3 cover SCRIPT w=%.3f cover_now=%d yaw=%.2f pitch=%.2f T=%.4f\n",(double)w,cover_now,(double)u3_cover_yaw,(double)u3_cover_pitch,now*1e-6); }
+    u3_turn_pose(p,u3_cover_pivot,u3_cover_yaw*k,u3_cover_pitch*k);
+    return 1;
+}
 static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
     (void)rdi; (void)rsi;
     if (mouse_debug() && r14) {   /* (diagnostic) the set of camera layers of a frame (class = vtable - image base, weight), printed when it changes */
@@ -4262,6 +4315,7 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
         uint64_t vt=0;
         if (safe_read(&vt,r14,8) && vt==runtime_image_base()+0x1671c30) { u3_look_layer(r14,image); return; }
     }
+    if (r14 && !aim_held && u3_cover_script_layer(r14)) return;
     if (r14 && !aim_held && u3_walk_update_us && now_us()-u3_walk_update_us>150000 && !(u3_cover_seen_us && now_us()-u3_cover_seen_us<2000000) &&
         !(u3_aim_active_us && now_us()-u3_aim_active_us<1500000) && !look_held && now_us()>=look_blend_until_us) {
         uint64_t vt=0;
