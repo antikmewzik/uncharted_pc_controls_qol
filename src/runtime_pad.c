@@ -4556,17 +4556,26 @@ static void u3_walk_follow_cover(uint64_t camera, uint64_t now) {
 }
 /* The position the walking camera shows (+0x7680, a spring) is put on the elevation of its target (+0x7650) about the pivot (+0x78a0), at the distance the
  * game gave it, so that a tilt of the arc shows at once instead of trailing behind the mouse (the same as the free view's, for the climb-class layer). */
-static void u3_snap_shown_elevation(uint64_t camera) {
+static void u3_snap_shown_elevation(uint64_t camera, float darc) {
     const float *piv=(const float *)(uintptr_t)(camera+0x78a0), *t=(const float *)(uintptr_t)(camera+0x7650);
     float *pos=(float *)(uintptr_t)(camera+0x7680);
     const float r=SDL_sqrtf((t[0]-piv[0])*(t[0]-piv[0])+(t[2]-piv[2])*(t[2]-piv[2]));
-    if (!(r>0.3f && r<50.0f)) return;
-    const float te=SDL_atan2f(t[1]-piv[1],r);
+    static int dmode=-1; if (dmode<0) { const char *s=getenv("BB_U3_SNAPMODE"); dmode=!(s && atoi(s)==0); }   /* BB_U3_SNAPMODE=0: the old way, the position put on the target's whole elevation */
+    if (dmode && (darc==0.0f || !(darc>-0.5f && darc<0.5f))) return;
+    if (!dmode && !(r>0.3f && r<50.0f)) return;
+    /* New way (2026-11-04): the position is tilted by exactly what the mouse tilted, the offset the game's collisions gave it is kept. Put on the target's elevation
+     * it fought the wall's pushes (probe: height and distance jumping by 0.1 to 0.25 m in opposite directions, 76 jumps in 12 s against a wall, 0 with the pad). */
+    const float te=dmode ? 0.0f : SDL_atan2f(t[1]-piv[1],r);
     float px=pos[0]-piv[0], py=pos[1]-piv[1], pz=pos[2]-piv[2];
     const float h=SDL_sqrtf(px*px+pz*pz);
     if (!(h>0.1f && h<50.0f)) return;
-    const float e=SDL_atan2f(py,h), want=te-e, d=want>0.35f ? 0.35f : want<-0.35f ? -0.35f : want;
-    const float len=SDL_sqrtf(h*h+py*py), e2=e+d, k=len*SDL_cosf(e2)/h;
+    const float e=SDL_atan2f(py,h), want=dmode ? darc*105.0f*0.017453293f : te-e, d=want>0.35f ? 0.35f : want<-0.35f ? -0.35f : want;
+    const float len=SDL_sqrtf(h*h+py*py);
+    float e2=e+d;
+    if (!dmode) { static float ymax=-1.0f; if (ymax<0.0f) { const char *s=getenv("BB_U3_SNAP_YMAX"); ymax=s ? (float)atof(s) : 2.1f; }   /* the game keeps the camera under 2.2 m above the pivot: imposing more made it push back every frame (vertical tremble in water, 2026-11-04) */
+      const float lim=py>ymax ? py : ymax;   /* (never pulled down: looking down the camera is legitimately 3 m above, measured) */
+      if (ymax>0.0f && len>lim && len*SDL_sinf(e2)>lim) e2=SDL_asinf(lim/len); }
+    const float k=len*SDL_cosf(e2)/h;
     px*=k; pz*=k; py=len*SDL_sinf(e2);
     if (px>-400.0f && px<400.0f && py>-400.0f && py<400.0f && pz>-400.0f && pz<400.0f) { pos[0]=piv[0]+px; pos[1]=piv[1]+py; pos[2]=piv[2]+pz; }
 }
@@ -4574,8 +4583,18 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     (void)image; (void)r14;
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
-    if (disabled || pad_only_mode || camera<0x10000) return;
-    if ((out&0xfffu)!=0x1f0u) return;
+    if (camera<0x10000 || (out&0xfffu)!=0x1f0u) return;
+    {   /* BB_U3_WALKPROBE is recorded in pad-only mode too (nothing of ours is written there: the game's own camera, to compare with the mouse's) */
+        static FILE *wf0; static int winit0; static unsigned wn0;
+        if (!winit0) { winit0=1; const char *p=getenv("BB_U3_WALKPROBE"); if (p && *p) { char q[1024]; snprintf(q,sizeof(q),"%s.pad",p); wf0=fopen(q,"wb"); } }
+        static unsigned char wbuf0[0x300];
+        if (wf0 && pad_only_mode && wn0<6000 && safe_read(wbuf0,camera+0x7600,sizeof(wbuf0))) {
+            const double pt=now_us()*1e-6; const uint64_t pc=camera; const uint32_t cov=0, pad=1;
+            fwrite(&pt,8,1,wf0); fwrite(&pc,8,1,wf0); fwrite(&cov,4,1,wf0); fwrite(&pad,4,1,wf0); fwrite(wbuf0,1,sizeof(wbuf0),wf0);
+            if ((++wn0&63)==0) fflush(wf0);
+        }
+    }
+    if (disabled || pad_only_mode) return;
     { float pv[3]; if (safe_read(pv,camera+0x78a0,12) && (pv[0]!=0.0f || pv[1]!=0.0f || pv[2]!=0.0f) && pv[0]>-100000.0f && pv[0]<100000.0f && pv[1]>-100000.0f && pv[1]<100000.0f && pv[2]>-100000.0f && pv[2]<100000.0f) { u3_walk_pivot_last[0]=pv[0]; u3_walk_pivot_last[1]=pv[1]; u3_walk_pivot_last[2]=pv[2]; u3_walk_pivot_ok=1; } }   /* (the V view replaces the walking camera and its object is zeroed: its last pivot is kept) */
     const uint64_t now=now_us();
     u3_walk_update_us=now;
@@ -4601,6 +4620,10 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
             }
             u3_wt_slot[sl].seen_us=now;
             float deg=(float)(u3_anim_given-u3_wt_slot[sl].applied);
+            if (deg>60.0f || deg<-60.0f) {   /* a camera that slept and wakes was owed the whole turn made meanwhile: the picture jumped by it at a door (measured 2026-11-04: 243 degrees in one update). A real fast flick is far under 60 degrees per update */
+                if (mouse_debug()) printf("Mouse: U3 WT cam=%llx catch-up of %.1f degrees dropped t=%.4f\n",(unsigned long long)camera,(double)deg,now*1e-6);
+                u3_wt_slot[sl].applied=u3_anim_given; deg=0.0f;
+            }
             float corr=0.0f, lagfix=0.0f;
             {   /* what the game undid of our last turn is made up, as follow_camera does (the game puts its own direction back; without this the turn goes slow, something fights it) */
                 const float heading=heading_of((const float *)(uintptr_t)(camera+0x78c0));
@@ -4655,16 +4678,17 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
         if (safe_read(&arc,camera+0x7874,4) && arc>-3.0f && arc<3.0f) {
             static float top=-1.0f;
             if (top<0.0f) { const char *e=getenv("BB_U3_ARC_TOP"); top=e ? (float)atof(e) : 1.0f; }   /* (the pad's own stops in this camera, measured 2026-11-01: 0.00 and 1.00) */
+            float snap_darc=0.0f;   /* the tilt this frame's mouse really made (after the stops), for u3_snap_shown_elevation */
             if (u3_anim_arc_delta!=0.0f) {
                 float v=arc+u3_anim_arc_delta;
                 v=v<0.0f ? 0.0f : v>top ? top : v;
-                if (v==v) *(float *)(uintptr_t)(camera+0x7874)=v;
+                if (v==v) { *(float *)(uintptr_t)(camera+0x7874)=v; snap_darc=v-arc; }
                 static float snap_min=-1.0f; if (snap_min<0.0f) { const char *e=getenv("BB_U3_SNAP_MIN"); snap_min=e ? (float)atof(e) : 0.004f; }   /* arc per frame (0.004 = ~0.5 degree): the hand's small tilts do not put the position on the target, which fought the game's 2.2 m limit (vertical tremble in corridors, measured 2026-11-02) */
                 if (u3_anim_arc_delta>snap_min || u3_anim_arc_delta<-snap_min) u3_anim_snap_us=now;
                 u3_anim_arc_delta=0.0f;
             }
             static int snap_on=-1; if (snap_on<0) { const char *e=getenv("BB_U3_SNAP"); snap_on=!(e && atoi(e)==0); }   /* BB_U3_SNAP=0: the position shown is not put on the target's elevation (test: vertical tremble against the game's 2.2 m limit) */
-            if (snap_on && u3_anim_snap_us && now-u3_anim_snap_us<150000 && !input.free_view_smoothing) u3_snap_shown_elevation(camera);   /* (while the mouse tilts, and a moment after) */
+            if (snap_on && ((u3_anim_snap_us && now-u3_anim_snap_us<150000) || snap_darc!=0.0f) && !input.free_view_smoothing) u3_snap_shown_elevation(camera,snap_darc);   /* (while the mouse tilts, and a moment after: with the new way only the frames where it tilts do something) */
             if (mouse_debug()) { static uint64_t arc_us; if (now-arc_us>100000) { arc_us=now; printf("Mouse: U3 ANIMARC t=%.4f arc=%.4f top=%.2f\n",now*1e-6,(double)*(const float *)(uintptr_t)(camera+0x7874),(double)top); } }
         }
         return;
@@ -4788,7 +4812,8 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     follow_arc_max=0.76f;
     follow_camera(camera,0x78c0,0x7874,105.0f,0,0);
     follow_arc_max=1.0f;
-    if (mouse_debug()) { static uint64_t arc_us; if (now-arc_us>100000) { arc_us=now; printf("Mouse: U3 ARC t=%.4f before=%.4f after=%.4f mouse=%d\n",now*1e-6,(double)arc0,(double)*(const float *)(uintptr_t)(camera+0x7874),follow_arc_moved); } }
+    if (mouse_debug()) { static uint64_t arc_us; if (now-arc_us>20000) { arc_us=now; { const float *vp=(const float *)(uintptr_t)(camera+0x7680), *vv=(const float *)(uintptr_t)(camera+0x78a0), *vt=(const float *)(uintptr_t)(camera+0x7650);
+      printf("Mouse: U3 ARC t=%.4f before=%.4f after=%.4f mouse=%d pos_dy=%.3f tgt_dy=%.3f h=%.3f piv_y=%.3f\n",now*1e-6,(double)arc0,(double)*(const float *)(uintptr_t)(camera+0x7874),follow_arc_moved,(double)(vp[1]-vv[1]),(double)(vt[1]-vv[1]),(double)SDL_sqrtf((vp[0]-vv[0])*(vp[0]-vv[0])+(vp[2]-vv[2])*(vp[2]-vv[2])),(double)vv[1]); } } }
     if (u3_tk_key && u3_tk_key==u3_cover_seen_us && arc0==arc0) {   /* (the tilt the mouse added this frame: 105 degrees per unit of arc) */
         const float da=*(const float *)(uintptr_t)(camera+0x7874)-arc0;
         if (da>-0.5f && da<0.5f) u3_tk_e-=da*105.0f;   /* (more arc = camera higher = looks further down) */
@@ -4838,8 +4863,14 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
             if (h>0.1f && follow_gap_us<U2_FOLLOW_RESYNC_US) {
                 /* The position's elevation is put on the target's (no vertical smoothing): the spring's lag behind the mouse's tilt is not left to show. Along the arc
                  * about the pivot, at the distance the game gave it, and only while the mouse tilts (a wall's pushes are left to the game). */
-                const float e=SDL_atan2f(py,h), want=target_elev-e, d=want>0.35f ? 0.35f : want<-0.35f ? -0.35f : want;
-                const float len=SDL_sqrtf(h*h+py*py), e2=e+d, k=len*SDL_cosf(e2)/h;                px*=k; pz*=k; py=len*SDL_sinf(e2);
+                static int tmode=-1; if (tmode<0) { const char *s=getenv("BB_U3_TILTMODE"); tmode=!(s && atoi(s)==0); }   /* BB_U3_TILTMODE=0: the old way, the position put on the target's whole elevation */
+                const float da_mouse=*(const float *)(uintptr_t)(camera+0x7874)-arc0;   /* (only the tilt the mouse made this frame: the target's own bob when swimming was copied 1:1 to the screen, the pad's spring smooths it: vertical tremble in water, 2026-11-04) */
+                const float e=SDL_atan2f(py,h), want=tmode ? (da_mouse>-0.5f && da_mouse<0.5f ? da_mouse*105.0f*0.017453293f : 0.0f) : target_elev-e, d=want>0.35f ? 0.35f : want<-0.35f ? -0.35f : want;
+                const float len=SDL_sqrtf(h*h+py*py);
+                float e2=e+d;
+                { const float lim=py>2.1f ? py : 2.1f; if (len>lim && len*SDL_sinf(e2)>lim) e2=SDL_asinf(lim/len); }   /* (under the game's 2.2 m limit: see u3_snap_shown_elevation) */
+                const float k=len*SDL_cosf(e2)/h;
+                px*=k; pz*=k; py=len*SDL_sinf(e2);
             }
         }
         if (follow_applied!=0.0f) {
