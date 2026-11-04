@@ -4105,7 +4105,9 @@ static float u3_anim_total_yaw, u3_anim_total_pitch, u3_anim_a_yaw, u3_anim_a_pi
 /* U3, climb-class layer (+0x1671390) while it shows plain walking: the game moves Drake by the walking camera's heading (+0x78c0), which the layer reads. The mouse's turn is
  * handed to that camera (u3_walk_camera applies it, direction and position shown turned about the pivot) so that the picture and the movement share one heading; the layer
  * then turns nothing. If the walking camera does not apply it within 60 ms the layer takes the turn itself for a second (BB_U3_WALKTURN=0: always the layer, as before). */
-static double u3_anim_given, u3_anim_given_applied, u3_anim_skipped; static uint64_t u3_anim_unapplied_since_us, u3_walkturn_off_until;   /* degrees handed since the spell began / applied by some walking camera / taken by the layer instead */
+static double u3_anim_given, u3_anim_given_applied, u3_anim_skipped; static uint64_t u3_anim_unapplied_since_us, u3_walkturn_off_until;
+static double u3_wt_carry; static uint64_t u3_wt_carry_us;   /* the turn the layer carried alone when the walking cameras took the mouse back (measured 2026-11-04: 118 degrees lost in one frame); every walking camera, new ones too, is owed it for 2 s */
+static float u3_wt_carry_owed(uint64_t now) { return (u3_wt_carry_us && now>u3_wt_carry_us && now-u3_wt_carry_us<2000000) ? (float)u3_wt_carry : 0.0f; }   /* degrees handed since the spell began / applied by some walking camera / taken by the layer instead */
 #define U3_WT_SLOTS 24   /* the game makes a walking camera every ~0.15 s and one that is no longer updated can still be the shown layer for a second: 4 forgot it and the picture froze under the new one */
 static uint64_t u3_wt_push_us;
 static struct { uint64_t camera, seen_us, moved_us; double applied; float target, prev_total, off0; int have_off0; } u3_wt_slot[U3_WT_SLOTS];   /* off0: the position's heading minus the direction's at the start of a turn (the game's spring lags it by up to 25 degrees on a fast turn, measured) */   /* target: the heading wanted (follow_camera's follow_target), prev_total: the turn made last call */   /* each walking camera object catches up with u3_anim_given when its update runs (the game keeps several, a new one comes while another is still shown) */
@@ -4144,6 +4146,21 @@ static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim:
             if (mouse_debug()) printf("Mouse: U3 WALKTURN not applied by the walking camera: the layer turns the picture (t=%.4f)\n",now*1e-6);
         } else wm=1;
     }
+    {   /* the walking cameras take the mouse back (the 1 s "not applied" suspension ended): the turn the layer carried alone is handed to them, or the picture loses it in one frame */
+        static int wm_prev; static uint64_t wm_prev_us;
+        if (now-wm_prev_us>300000) wm_prev=0;
+        wm_prev_us=now;
+        if (wm && !wm_prev) {
+            const double c=(total_yaw-(u3_anim_given_applied-u3_anim_skipped))-(u3_anim_given-u3_anim_given_applied);
+            if (c>1.0 || c<-1.0) {
+                u3_anim_given+=c;
+                if (!u3_anim_unapplied_since_us) u3_anim_unapplied_since_us=now;
+                u3_wt_carry=(u3_wt_carry_owed(now)!=0.0f ? u3_wt_carry : 0.0)+c; u3_wt_carry_us=now;
+                if (mouse_debug()) printf("Mouse: U3 WALKTURN handover: the walking cameras are owed %.1f degrees the layer carried (t=%.4f)\n",c,now*1e-6);
+            }
+        }
+        wm_prev=wm;
+    }
     if (!(frame_us && now-frame_us<1500)) {
         float step, step_pitch;
         if (u2_mouse_turn(&turn,0,r14,u2_frame_dt(image),1.0f,0.0f,&step,&step_pitch)) {
@@ -4178,11 +4195,25 @@ static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim:
     if (wm) {   /* the walking camera carries the turn, this layer reads it; a layer of a walking camera that is no longer updated (the game fades in a new one over ~1 s) is turned here by what that camera lacks */
         int ws=-1;
         for (int i=0;i<U3_WT_SLOTS;++i) if (u3_wt_slot[i].camera && u3_wt_slot[i].camera==r14) ws=i;   /* (the layer object is the walking camera's own object, measured 2026-11-02: r14 equals the camera the walking hook was given) */
+        static uint64_t adopted_cam, prev_h_us; static float prev_h;   /* the heading the base layer showed last frame (after our turn) */
+        if (ws<0 && w>0.5f && prev_h_us && now>prev_h_us && now-prev_h_us<300000) {   /* the game swaps the base layer for a camera object the walking hook never updates (measured 2026-11-04: 44a80 turned to 64 degrees -> 44800 at the game's 118, a 52 degree jump): it takes over the heading shown, and is owed the mouse's turn from then on */
+            const float fw0[3]={0.0f,0.0f,1.0f}; float f0[3]; quat_rotate(p+4,fw0,f0);
+            const float lack0=wrap_degrees(SDL_atan2f(f0[0],f0[2])*57.29578f-prev_h);
+            if (lack0==lack0 && (lack0>2.0f || lack0<-2.0f)) {
+                int sl=0; for (int i=1;i<U3_WT_SLOTS;++i) if (u3_wt_slot[i].seen_us<u3_wt_slot[sl].seen_us) sl=i;
+                memset(&u3_wt_slot[sl],0,sizeof(u3_wt_slot[sl]));
+                u3_wt_slot[sl].camera=r14; u3_wt_slot[sl].applied=u3_anim_given-lack0; u3_wt_slot[sl].seen_us=now-60000;
+                adopted_cam=r14; ws=sl;
+                if (mouse_debug()) printf("Mouse: U3 WALKTURN base layer %llx adopted: %.1f degrees to the heading shown (t=%.4f)\n",(unsigned long long)r14,(double)lack0,now*1e-6);
+            }
+        }
+        if (ws>=0 && r14==adopted_cam && now>u3_wt_slot[ws].seen_us && now-u3_wt_slot[ws].seen_us>50000) u3_wt_slot[ws].seen_us=now-60000;   /* (stays owed past 1.5 s; the hook would set seen_us=now) */
         const int stale=ws>=0 && now>u3_wt_slot[ws].seen_us && now-u3_wt_slot[ws].seen_us>50000 && now-u3_wt_slot[ws].seen_us<1500000;   /* (older than that: the address was reused, nothing is owed) */
         if (stale) {
             const float lack=(float)(u3_anim_given-u3_wt_slot[ws].applied);
             if (lack>0.001f || lack<-0.001f) u3_turn_pose(p,pivot,lack,0.0f);
         }
+        if (w>0.5f) { const float fw3[3]={0.0f,0.0f,1.0f}; float f3[3]; quat_rotate(p+4,fw3,f3); prev_h=SDL_atan2f(f3[0],f3[2])*57.29578f; prev_h_us=now; }
         if (mouse_debug()) {   /* (trace) every layer call: the heading of its pose after our turn, to compare the instances blended in one frame */
             const float fw2[3]={0.0f,0.0f,1.0f}; float f2[3]; quat_rotate(p+4,fw2,f2);
             printf("Mouse: U3 WTL r14=%llx w=%.3f h=%.2f stale=%d t=%.4f\n",(unsigned long long)r14,(double)w,(double)(SDL_atan2f(f2[0],f2[2])*57.29578f),stale,now*1e-6);
@@ -4668,13 +4699,14 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
         if (u3_walkturn_on() && now>=u3_walkturn_off_until) {   /* the mouse's turn the layer handed over, as the cumulative u3_anim_given: this camera catches up with what it has not had (a new walking camera comes while another is still shown) */
             int sl=-1;
             for (int i=0;i<U3_WT_SLOTS;++i) if (u3_wt_slot[i].camera==camera) sl=i;
-            if (sl<0) { sl=0; for (int i=1;i<U3_WT_SLOTS;++i) if (u3_wt_slot[i].seen_us<u3_wt_slot[sl].seen_us) sl=i; u3_wt_slot[sl].camera=camera; u3_wt_slot[sl].applied=u3_anim_given; }   /* (a new camera starts from the game's own heading, which follows the shown one) */
+            if (sl<0) { sl=0; for (int i=1;i<U3_WT_SLOTS;++i) if (u3_wt_slot[i].seen_us<u3_wt_slot[sl].seen_us) sl=i; u3_wt_slot[sl].camera=camera; u3_wt_slot[sl].applied=u3_anim_given-u3_wt_carry_owed(now); }   /* (a new camera starts from the game's own heading, which follows the shown one) */
             if (u3_wt_slot[sl].seen_us && now>u3_wt_slot[sl].seen_us && now-u3_wt_slot[sl].seen_us>1500000) {   /* the game reuses addresses: a camera not seen for 1.5 s is a new one, not owed the turns made meanwhile */
-                u3_wt_slot[sl].applied=u3_anim_given; u3_wt_slot[sl].moved_us=0; u3_wt_slot[sl].have_off0=0; u3_wt_slot[sl].prev_total=0.0f;
+                u3_wt_slot[sl].applied=u3_anim_given-u3_wt_carry_owed(now); u3_wt_slot[sl].moved_us=0; u3_wt_slot[sl].have_off0=0; u3_wt_slot[sl].prev_total=0.0f;
             }
             u3_wt_slot[sl].seen_us=now;
             float deg=(float)(u3_anim_given-u3_wt_slot[sl].applied);
-            if (deg>60.0f || deg<-60.0f) {   /* a camera that slept and wakes was owed the whole turn made meanwhile: the picture jumped by it at a door (measured 2026-11-04: 243 degrees in one update). A real fast flick is far under 60 degrees per update */
+            const float owed=u3_wt_carry_owed(now);
+            if ((deg>60.0f || deg<-60.0f) && !(owed!=0.0f && SDL_fabsf(deg)<=SDL_fabsf(owed)+60.0f)) {   /* (the handover's carry is owed on purpose) a camera that slept and wakes was owed the whole turn made meanwhile: the picture jumped by it at a door (measured 2026-11-04: 243 degrees in one update). A real fast flick is far under 60 degrees per update */
                 if (mouse_debug()) printf("Mouse: U3 WT cam=%llx catch-up of %.1f degrees dropped t=%.4f\n",(unsigned long long)camera,(double)deg,now*1e-6);
                 u3_wt_slot[sl].applied=u3_anim_given; deg=0.0f;
             }
@@ -4704,6 +4736,7 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
                 }
             }
             const float total_turn=deg+corr;
+            if (owed!=0.0f && (deg>1.0f || deg<-1.0f)) u3_wt_carry_us=0;   /* the first camera that takes the handover's turn settles the debt: the cameras the game starts after it begin from the heading it shows (measured 2026-11-04: a second camera was given the same -130 degrees, a 130 degree jump) */
             if (mouse_debug() && (deg!=0.0f || corr!=0.0f || u3_wt_slot[sl].prev_total!=0.0f)) {   /* (trace) the heading the game left, the turn we make, the heading we write: the next call's "before" minus this "after" is what the game undid */
                 float h1=heading_of((const float *)(uintptr_t)(camera+0x78c0));
                 const float *tp=(const float *)(uintptr_t)(camera+0x7680), *tv=(const float *)(uintptr_t)(camera+0x78a0);
