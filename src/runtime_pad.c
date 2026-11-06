@@ -3692,6 +3692,7 @@ static uint64_t u3_roll_us;   /* last frame of a roll with the aim held that the
 static float u3_aim_last_elev;      /* the same for the elevation of the look direction (degrees, up positive) */
 static uint64_t u3_pitch_fix_until_us;   /* after the release the walking camera's arc is brought to that elevation until then */
 static float u3_aim_last_heading;   /* the heading the picture had on the last frame of the aim (what the walking camera is put on at the release) */
+static uint64_t u3_hand_us;   /* last time the mouse moved or a movement key / the left stick was pushed (the fade pin of u3_layer_blend only holds while the hands are off) */
 static float u3_aim_pivot[3];   /* the player's pivot, as worked out from the aiming output (used by u3_layer_blend) */
 static float u3_anim_h;   /* U3: the heading the ledge / climb camera's layer left the picture at (degrees), handed to the walking camera when it comes back */
 static uint64_t u3_anim_layer_us;   /* U3: when the ledge / climb camera's layer last held the picture (the walking camera's update, which runs on, leaves the mouse to it) */
@@ -4376,6 +4377,15 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
         if (r14==u3_probe_aim_cam && bbgpu_camera_yaw(&ry,&ra)) printf("Mouse: U3 REND T=%.4f shown=%.2f age=%.3f\n",now_us()*1e-6,(double)ry,ra);
     }
     if (mouse_debug() && r14 && !aim_held && u3_aim_active_us && now_us()-u3_aim_active_us<1500000) printf("Mouse: U3 AIMFADE layer cam=%llx aimcam=%llx covercam=%llx tk_key=%d cover_age_ms=%.0f\n",(unsigned long long)r14,(unsigned long long)u3_probe_aim_cam,(unsigned long long)u3_cover_cam,(int)(u3_tk_key!=0),(double)((now_us()-u3_cover_seen_us)*1e-3));
+    if (mouse_debug() && r14 && !aim_held && u3_aim_active_us && now_us()-u3_aim_active_us<1500000) {   /* (trace FADELAY: every layer of the fade after an aim, class, weight and the heading/elevation of the blend so far, before our turn; the heading RENDERED is printed once per frame by the REND line) */
+        const RuntimeGuestRegs *fg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+        const float *fp=(const float *)(uintptr_t)fg->rax; float fw=0.0f, ff[3]; const float ffwd[3]={0.0f,0.0f,1.0f}; uint64_t fvt=0;
+        if ((uintptr_t)fp>0x10000 && safe_read(&fw,r14+0x108,4) && safe_read(&fvt,r14,8)) {
+            quat_rotate(fp+4,ffwd,ff);
+            float ry=0.0f; double ra=0.0; const int rok=bbgpu_camera_yaw(&ry,&ra);
+            printf("Mouse: U3 FADELAY T=%.4f cls=%#llx cam=%llx w=%.3f blend_h=%.2f blend_e=%.2f rendered=%.2f(age %.3f) release_ms=%.0f\n",now_us()*1e-6,(unsigned long long)(fvt-runtime_image_base()),(unsigned long long)r14,(double)fw,(double)(SDL_atan2f(ff[0],ff[2])*57.29578f),(double)(SDL_asinf(ff[1]>1.0f ? 1.0f : ff[1]<-1.0f ? -1.0f : ff[1])*57.29578f),rok ? (double)ry : 0.0,rok ? ra : -1.0,(double)((now_us()-u3_aim_active_us)*1e-3));
+        }
+    }
     if (mouse_debug() && r14 && !aim_held && u3_cover_seen_us && now_us()-u3_cover_seen_us<1500000) {   /* (trace: every layer of the stack after the cover, with its weight and the heading of the blend so far) */
         const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
         const float *p=(const float *)(uintptr_t)g->rax; float w=0.0f, pf[3]; const float fwd[3]={0.0f,0.0f,1.0f};
@@ -4433,6 +4443,28 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
                 if (swap_only) u3_turn_pose(p,own,wrap_degrees(hp-u3_layer_heading),ep-u3_layer_elev);
                 else u3_turn_pose(p,own,wrap_degrees(hp-u3_aim_last_heading),ep-u3_aim_last_elev);
                 if (mouse_debug() && swap_only) printf("Mouse: U3 SWFIN T=%.4f cam=%llx w=%.3f fin_pos=%.3f,%.3f,%.3f own=%.3f,%.3f,%.3f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)p[0],(double)p[1],(double)p[2],(double)own[0],(double)own[1],(double)own[2]);
+            }
+        }
+        return;
+    }
+    if (r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && now_us()-u3_aim_active_us<600000 && !(u3_hand_us>u3_aim_active_us+30000) && !(u3_cover_seen_us && now_us()-u3_cover_seen_us<2000000)) {
+        /* The walking layers that fade in over the released aim carry the game's raw walking camera, whose position shown starts ~13 degrees off its direction and
+         * relaxes (measured 2026-11-04 after the grenade launcher: the layers' own headings went to -78 while the picture was to stay at -66.5, the blend swung 6 degrees and
+         * came back in 0.9 s). Once each of them is blended in, the picture is put back on the heading the aim ended at (u3_aim_last_heading), tilt left to the game.
+         * BB_U3_FADEWALK=0 turns this off. */
+        static int fw_on=-1; if (fw_on<0) { const char *e=getenv("BB_U3_FADEWALK"); fw_on=!(e && atoi(e)==0); }
+        uint64_t vt=0;
+        if (fw_on && safe_read(&vt,r14,8) && (vt==runtime_image_base()+0x1671390 || vt==runtime_image_base()+0x16705f0)) {
+            const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            float *p=(float *)(uintptr_t)g->rax;
+            if ((uintptr_t)p>0x10000) {
+                const float len2=p[4]*p[4]+p[5]*p[5]+p[6]*p[6]+p[7]*p[7];
+                if (len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f) {
+                    const float fwd[3]={0.0f,0.0f,1.0f}; float f[3];
+                    quat_rotate(p+4,fwd,f);
+                    const float hp=SDL_atan2f(f[0],f[2])*57.29578f, d=wrap_degrees(hp-u3_aim_last_heading);
+                    if (d>0.05f ? d<40.0f : d>-40.0f) { if (u3_turn_pose(p,u3_aim_pivot,d,0.0f) && mouse_debug()) printf("Mouse: U3 FADEWALK T=%.4f cam=%llx w=%.3f turned %.2f degrees (to %.2f)\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)d,(double)u3_aim_last_heading); }
+                }
             }
         }
         return;
@@ -4821,7 +4853,9 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
         }
     }
     { float ws[3]; if (safe_read(ws,camera+0x7680,12) && ws[0]>-100000.0f && ws[0]<100000.0f && ws[1]>-100000.0f && ws[1]<100000.0f && ws[2]>-100000.0f && ws[2]<100000.0f) { u3_walk_shown[0]=ws[0]; u3_walk_shown[1]=ws[1]; u3_walk_shown[2]=ws[2]; u3_walk_shown_us=now; } }
-    if (!aim_held && u3_aim_active_us && now-u3_aim_active_us<1500000 && (u3_aim_total_yaw!=0.0f || u3_aim_total_pitch!=0.0f)) {   /* (every frame of the fade: u3_layer_blend goes on turning the picture, this keeps the walking camera on it) */
+    /* (only while the aim layer still writes u3_aim_last_heading, ~0.5 s after the release: after that nothing updates it and the pin put the direction back on it every frame,
+     * undoing the mouse's turn for the rest of the 1.5 s fade, measured 2026-11-04: direction frozen at -35.87 while the target went to -22, "something fights the rotation") */
+    if (!aim_held && u3_aim_active_us && now-u3_aim_active_us<1500000 && (u3_aim_total_yaw!=0.0f || u3_aim_total_pitch!=0.0f) && (!u3_layer_us || now-u3_layer_us<100000 || getenv("BB_U3_FADEPIN_OLD"))) {   /* (every frame of the fade: u3_layer_blend goes on turning the picture, this keeps the walking camera on it) */
         /* The aim was let go: the walking camera, which stood still under the aiming one, is given the turn the mouse made meanwhile (direction, the
          * position shown turned about the pivot with it, and the arc), or the picture went back to where the aim began. */
         /* The game has already turned the walking camera by itself toward where Drake faces (measured: it was 85 degrees on its way when the turn was
@@ -7592,6 +7626,7 @@ static void sample_host(PadData *d) {
         ly=0;
     }
     if (ly) d->left_y=(uint8_t)(ly<0 ? 0 : 255);
+    if (lx || ly || d->left_x<100 || d->left_x>156 || d->left_y<100 || d->left_y>156) u3_hand_us=now;   /* (the player's hand on the movement keys / stick or the mouse: u3_layer_blend's fade pin lets go) */
     /* The walk key (configurable, none by default) held with the movement keys, outside the menus: the stick is pushed only part way */
     if (!menu_mode && (lx||ly) && action_down(A_WALK,k,mouse,now)) {
         /* stick deflection in percent of full (BB_WALK_STICK to tune): below the game's dead zone Drake stops (36 % did) */
@@ -7632,6 +7667,7 @@ static void sample_host(PadData *d) {
         }
         was_following=following;
     }
+    if (mdx || mdy) u3_hand_us=now_us();
     for (int q=0;q<CAMERA_QUEUES;++q) {
         /* queue 2 is the zoom camera's (U1 aiming): nothing else reads it, so it stays empty outside the aim */
         if (captured && (following || joypad || native || base_gap) && (q!=2 || aim_held || look_held || now_us()<aim_blend_until_us || u3_aim_fade_window(now_us()) ||now_us()<look_blend_until_us || (u2_chase_us && now_us()-u2_chase_us<200000))) { camera_dx[q]+=mdx; camera_dy[q]+=mdy; }
