@@ -3982,6 +3982,17 @@ static void u3_cover_layer(uint64_t r14) {
         u3_cover_yaw=wrap_degrees(SDL_atan2f(cf[0],cf[2])*57.29578f-u3_aim_last_heading);
         u3_cover_pitch=SDL_asinf(cf[1]>1.0f ? 1.0f : cf[1]<-1.0f ? -1.0f : cf[1])*57.29578f-u3_aim_last_elev;
     }
+    /* Moving along the cover the game makes a NEW cover camera at each step (new address, weight 0 -> 1 over ~0.9 s, the old one stops being called) and the picture
+     * fades from the walking camera's pose to its raw pose. A turn kept relative to the camera's pose (u3_cover_yaw) jumped by ~70 degrees at the switch and then
+     * drifted ~5 degrees a frame without the mouse (measured 2026-11-08, last_run_u3_couv_deplace2.log): the mouse felt slow / jerky. The picture shown is kept
+     * ABSOLUTE from the switch on, as after an aim. BB_U3_COVERABS=0 gives the old behaviour. */
+    static uint64_t last_cam; static int cover_abs_on=-1;
+    if (cover_abs_on<0) { const char *e=getenv("BB_U3_COVERABS"); cover_abs_on=!(e && atoi(e)==0); }
+    if (cover_abs_on && !aim_window && last_cam && r14!=last_cam && last_us && now-last_us<300000 && u3_cover_show_us && now-u3_cover_show_us<300000) {
+        abs_mode=1; abs_h=u3_cover_show_h; abs_e=u3_cover_show_e;
+        if (mouse_debug()) printf("Mouse: U3 cover NEWCAM %llx -> %llx w=%.3f picture kept at %.2f,%.2f T=%.4f\n",(unsigned long long)last_cam,(unsigned long long)r14,(double)w,(double)abs_h,(double)abs_e,now*1e-6);
+    }
+    last_cam=r14;
     last_us=now;
     u2_native_us=now;   /* the mouse is not sent to the emulated stick meanwhile */
     float dyaw=0.0f, dpitch=0.0f;   /* the mouse's turn this frame */
@@ -4006,7 +4017,10 @@ static void u3_cover_layer(uint64_t r14) {
     const float ef=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
     for (int i=0;i<3;++i) u3_cover_pivot[i]=pivot[i];
     u3_cover_pivot_ok=1;
-    if (mouse_debug()) printf("Mouse: U3 cover w=%.2f yaw=%.2f pitch=%.2f elev=%.2f pivot=%.2f,%.2f,%.2f abs=%d absh=%.2f abse=%.2f\n",(double)w,(double)u3_cover_yaw,(double)u3_cover_pitch,(double)ef,(double)pivot[0],(double)pivot[1],(double)pivot[2],abs_mode,(double)abs_h,(double)abs_e);
+    if (mouse_debug()) {
+        float ry=0.0f; double ra=0.0; const int rh=bbgpu_camera_yaw(&ry,&ra);   /* the heading the last rendered frame showed, to compare with what is written (absh is the mouse's heading; rendered yaw has its own sign / origin: compare the changes) */
+        printf("Mouse: U3 cover w=%.2f yaw=%.2f pitch=%.2f elev=%.2f pivot=%.2f,%.2f,%.2f abs=%d absh=%.2f abse=%.2f rend=%.2f%s\n",(double)w,(double)u3_cover_yaw,(double)u3_cover_pitch,(double)ef,(double)pivot[0],(double)pivot[1],(double)pivot[2],abs_mode,(double)abs_h,(double)abs_e,rh ? (double)ry : 0.0,rh && ra<0.25 ? "" : "?");
+    }
     float cf[3]; const float fwd[3]={0.0f,0.0f,1.0f};
     quat_rotate(cq,fwd,cf);
     const float hcq=SDL_atan2f(cf[0],cf[2])*57.29578f, ecq=SDL_asinf(cf[1]>1.0f ? 1.0f : cf[1]<-1.0f ? -1.0f : cf[1])*57.29578f;
@@ -4408,6 +4422,31 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
         if (u3_tk_key && u3_tk_key==u3_cover_seen_us && !aim_held && now_us()-u3_cover_seen_us>=60000) { u3_cover_exit_layer(r14); return; }
         if (!aim_held && u3_tk_key!=u3_cover_seen_us && (u3_exit_test()&2) && !(u3_exit_test()&1) && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us) && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<400000) { u3_cover_hold(r14); return; }
         u3_cover_layer(r14); return;
+    }
+    /* Moving along a cover the game keeps several cover-class cameras (class +0x1670210) in the stack, one more at each step, fading over the previous one.
+     * Only the one whose update (0x4ce080) we see is turned; the newer ones, blended over it, showed their raw pose: the picture stood still or lagged
+     * while the cover layer's own written heading followed the mouse (measured 2026-11-08: written 10 degrees a frame, rendered 0 for seconds, then a jump).
+     * Each other cover-class layer is put on the picture the cover layer shows (u3_cover_show_h/e). BB_U3_COVEROVER=0 switches it off. */
+    {
+        static int over=-1; if (over<0) { const char *e=getenv("BB_U3_COVEROVER"); over=!(e && atoi(e)==0); }
+        const uint64_t tn=now_us();
+        uint64_t cvt=0; float cw=0.0f;
+        if (over && r14 && !aim_held && !pad_only_mode && r14!=u3_cover_cam && u3_cover_pivot_ok && u3_cover_seen_us && tn-u3_cover_seen_us<100000 && u3_cover_show_us && tn-u3_cover_show_us<100000 &&
+            safe_read(&cvt,r14,8) && cvt==runtime_image_base()+0x1670210 && safe_read(&cw,r14+0x108,4) && cw>0.0005f && cw<=1.0001f) {
+            const RuntimeGuestRegs *cg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            float *cp=(float *)(uintptr_t)cg->rax;
+            if ((uintptr_t)cp>0x10000) {
+                const float l2=cp[4]*cp[4]+cp[5]*cp[5]+cp[6]*cp[6]+cp[7]*cp[7];
+                if (l2>0.98f && l2<1.02f && cp[0]>-100000.0f && cp[0]<100000.0f && cp[1]>-100000.0f && cp[1]<100000.0f && cp[2]>-100000.0f && cp[2]<100000.0f) {
+                    const float fw[3]={0.0f,0.0f,1.0f}; float f[3];
+                    quat_rotate(cp+4,fw,f);
+                    const float hp=SDL_atan2f(f[0],f[2])*57.29578f, ep=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
+                    if (mouse_debug()) { static uint64_t lt; if (tn-lt>100000) { lt=tn; printf("Mouse: U3 cover OVER cam=%llx w=%.3f pic=%.2f,%.2f -> %.2f,%.2f T=%.4f\n",(unsigned long long)r14,(double)cw,(double)hp,(double)ep,(double)u3_cover_show_h,(double)u3_cover_show_e,tn*1e-6); } }
+                    u3_turn_pose(cp,u3_cover_pivot,wrap_degrees(hp-u3_cover_show_h),ep-u3_cover_show_e);
+                    return;
+                }
+            }
+        }
     }
     if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && u3_aim_h0_ok && ((now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
         const int swap_only=u3_swap_press_us && now_us()-u3_swap_press_us<1500000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000);
