@@ -330,7 +330,8 @@ static float u3_walk_shown[3]; static uint64_t u3_walk_shown_us;   /* U3: the po
 static int u3_aim_fade_window(uint64_t now) { return u3_aim_active_us && now-u3_aim_active_us<1500000; }   /* U3: the layer hook (u3_layer_blend) goes on taking queue 2 for 1.5 s after the aim, longer than aim_blend_until_us (1.3 s): measured, in the last 0.2 s it had no mouse and held the picture still */
 static volatile int aim_native;   /* aim_held and the zoom (aiming) camera runs: L2 held during a roll aims nothing yet, and the mouse must keep turning the free view then */
 static volatile int aim_held;             /* L2 is held: the aiming camera (also while it blends in) */
-static volatile int l2_held;              /* L2 itself, without the cases where the game aims on its own (turret) */
+static volatile int l1_held;              /* L1 itself (grenade launcher aim in U3) */
+static volatile int l2_held;             /* L2 itself, without the cases where the game aims on its own (turret) */
 static volatile uint64_t u3_turret_us;    /* U3: last frame the turret's aiming-class layer was shown alone on top */
 static volatile uint64_t look_blend_until_us; /* the look-around camera (V) is blended out for about a second after the key is released: it keeps the mouse until then */
 static volatile int look_held;            /* R3 is held: first-person look around, which turns like the aim */
@@ -3771,8 +3772,11 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     const float len2=o[4]*o[4]+o[5]*o[5]+o[6]*o[6]+o[7]*o[7];
     if (!(len2>0.98f && len2<1.02f && o[0]>-100000.0f && o[0]<100000.0f && o[1]>-100000.0f && o[1]<100000.0f && o[2]>-100000.0f && o[2]<100000.0f)) return;
     if (!blending_out) {
-        const int roll_cont=!was_out && u3_roll_us && now-u3_roll_us<300000;
-        if (was_out || !u3_aim_active_us || (now-u3_aim_active_us>300000 && !roll_cont)) {   /* (every new aim starts from the picture it finds, see u3_layer_blend: the total is not carried over a release) */
+        static int rc=-1; if (rc<0) { const char *e=getenv("BB_U3_ROLLCONT"); rc=!(e && e[0]=='0'); }   /* BB_U3_ROLLCONT=0: the old test (u3_roll_us alone) */
+        /* (u3_roll_us is also stamped every frame by the "aiming camera gone" branch of the grenade launcher, with no roll: the camera that came back after the throw then kept the old total on top of a picture that already held it, a jump of 40-60 degrees, measured 2026-11-08: a roll needs its Circle press) */
+        const int roll_cont=!was_out && u3_roll_us && now-u3_roll_us<300000 && (!rc || (u3_roll_press_us && now-u3_roll_press_us<1500000));
+        const int gone_long=rc && !roll_cont && u3_aim_frame_us && now>u3_aim_frame_us && now-u3_aim_frame_us>100000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000);   /* (the camera was away over 0.1 s without a roll or a shoulder switch: grenade launcher, see above) */
+        if (was_out || !u3_aim_active_us || gone_long || (now-u3_aim_active_us>300000 && !roll_cont)) {   /* (every new aim starts from the picture it finds, see u3_layer_blend: the total is not carried over a release) */
             u3_aim_total_yaw=u3_aim_total_pitch=0.0f;
             u3_aim_from_cover=0; u3_aim_h0_ok=0; u3_aim_base_yaw=u3_aim_base_pitch=0.0f;
             /* From cover: the aim starts from the cover camera's raw picture (u3_cover_layer stops turning it at the press), the mouse's turn since the
@@ -3880,6 +3884,11 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
 static float u3_cover_pivot[3]; static int u3_cover_pivot_ok;
 /* Turn a pose (position [0..2], quaternion [4..7]) by yaw (degrees, positive = to the right) about the world's up and pitch (positive = down) about its own x,
  * the position turned about the pivot in the camera's frame. */
+/* After a grenade-launcher shot the aiming camera is gone ~0.25 s before the release; the walking layer pin must then hold even though the mouse moves (BB_U3_GONEPIN=0: off) */
+static int u3_gone_pin(void) {
+    static int off=-1; if (off<0) { const char *e=getenv("BB_U3_GONEPIN"); off=(e && e[0]=='0'); }
+    return !off && u3_aim_active_us && now_us()-u3_aim_active_us>60000;
+}
 static int u3_turn_pose(float *p, const float *pivot, float yaw, float pitch) {
     const float ya=-yaw*0.017453293f*0.5f, pa=pitch*0.017453293f*0.5f;
     const float qyaw[4]={0.0f,SDL_sinf(ya),0.0f,SDL_cosf(ya)}, qpitch[4]={SDL_sinf(pa),0.0f,0.0f,SDL_cosf(pa)};
@@ -4319,7 +4328,29 @@ static int u3_cover_script_layer(uint64_t r14) {
     u3_turn_pose(p,u3_cover_pivot,u3_cover_yaw*k,u3_cover_pitch*k);
     return 1;
 }
+static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14);
 static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
+    {   /* The game reuses addresses: once the grenade launcher's aiming camera is gone, the walking camera (class +0x1671390) can get its old address, and was then handled as the aiming camera (its layer written by the aim code, whose pivot differs: the position jumped ~1 m, 0.6 s after the throw, only on some throws; measured on the final pose 2026-11-08). A layer of the walking class at the aim's address while the aim camera has not run for 40 ms is not the aim. BB_U3_AIMADDR=0: off */
+        static int aa=-1; if (aa<0) { const char *e=getenv("BB_U3_AIMADDR"); aa=!(e && e[0]=='0'); }
+        uint64_t avt=0;
+        if (aa && r14 && r14==u3_probe_aim_cam && u3_aim_frame_us && now_us()>u3_aim_frame_us && now_us()-u3_aim_frame_us>40000 && safe_read(&avt,r14,8) && avt==runtime_image_base()+0x1671390) {
+            if (mouse_debug()) printf("Mouse: U3 AIMADDR T=%.4f cam=%llx is a walking layer, not the aim\n",now_us()*1e-6,(unsigned long long)r14);
+            u3_probe_aim_cam=0;
+        }
+    }
+    u3_layer_blend_impl(rdi,rsi,image,r14);
+    if (!mouse_debug()) return;
+    static int fp=-1; if (fp<0) { const char *e=getenv("BB_U3_FINALPOSE"); fp=(e && e[0]=='1'); }
+    const uint64_t tn=now_us();
+    if (!fp || !r14 || !(aim_held || (u3_aim_active_us && tn-u3_aim_active_us<2500000))) return;
+    const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    const float *p=(const float *)(uintptr_t)g->rax;
+    uint64_t vt=0; float w=0.0f;
+    if ((uintptr_t)p<0x10000 || !safe_read(&vt,r14,8) || !safe_read(&w,r14+0x108,4)) return;
+    const float fwd[3]={0.0f,0.0f,1.0f}; float f[3]; quat_rotate(p+4,fwd,f);
+    printf("Mouse: FP T=%.4f cls=%#llx w=%.3f pos=%.3f,%.3f,%.3f h=%.2f e=%.2f\n",tn*1e-6,(unsigned long long)(vt-runtime_image_base()),(double)w,(double)p[0],(double)p[1],(double)p[2],(double)(SDL_atan2f(f[0],f[2])*57.29578f),(double)(SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f));
+}
+static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
     (void)rdi; (void)rsi;
     if (mouse_debug() && r14) {   /* (diagnostic) the set of camera layers of a frame (class = vtable - image base, weight), printed when it changes */
         static uint64_t cur[8], last[8], last_us; static float cw[8], lw[8]; static int n_cur, n_last;
@@ -4344,7 +4375,7 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
         static uint64_t turret_since_us, turret_seen_us; static int turret_on;
         const uint64_t tn=now_us();
         static uint64_t l2_last_us;
-        if (l2_held) l2_last_us=tn;
+        if (l2_held || l1_held) l2_last_us=tn;   /* (L1, the grenade launcher: its layer also stays up at full weight ~0.3 s after the release and was taken for a turret, which restarted the aim from the current picture and dropped the total: a jump of 14-18 degrees at the throw, measured 2026-11-08) */
         if (turret_on && tn-turret_seen_us>150000) { turret_on=0; turret_since_us=0; }
         uint64_t tvt=0; float tw=0.0f;
         if (safe_read(&tvt,r14,8) && tvt==runtime_image_base()+0x16736f0 && safe_read(&tw,r14+0x108,4) && tw>=0.99f) {
@@ -4355,6 +4386,9 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
                 if (tn-turret_since_us>300000) turret_on=1;
             }
         }
+        /* U3 grenade launcher (L1): the aim layer fades in (~0.2 s) and used to be taken for a turret only 0.3 s after it was at full weight, so the mouse fell back to the walking camera during the whole fade (measured 2026-11-08). With L1 held the layer's presence is enough. BB_U3_L1AIM=0 restores the old behaviour. */
+        { static int l1aim_off=-1; if (l1aim_off<0) { const char *e=getenv("BB_U3_L1AIM"); l1aim_off=(e && e[0]=='0'); }
+          if (!l1aim_off && l1_held && !l2_held && tvt==runtime_image_base()+0x16736f0 && tw>=0.005f) u3_turret_us=tn; }
         if (turret_on) u3_turret_us=tn;
     }
     if (r14 && !aim_held && (look_held || now_us()<look_blend_until_us)) {
@@ -4448,6 +4482,25 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
             }
         }
     }
+    {   /* Grenade launcher, after the throw (L1 released): the aiming camera still runs ~0.5 s while the walking layer (+0x1671390) fades in over it. That layer holds the game's raw walking camera, which the mouse never turned: the picture slid back to it, against the mouse (measured 2026-11-08: written heading 99 -> 81, rendered 103 -> 111). Its pose is put on the aim's picture while it fades in. BB_U3_THROWFADE=0: off */
+        static int tf=-1; if (tf<0) { const char *e=getenv("BB_U3_THROWFADE"); tf=!(e && e[0]=='0'); }
+        uint64_t tvt=0; float tw=0.0f;
+        if (tf && r14 && r14!=u3_probe_aim_cam && aim_held && !l2_held && !l1_held && u3_aim_h0_ok && u3_aim_active_us && now_us()-u3_aim_active_us<30000 &&
+            safe_read(&tvt,r14,8) && tvt==runtime_image_base()+0x1671390 && safe_read(&tw,r14+0x108,4) && tw>0.002f) {
+            const RuntimeGuestRegs *tg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            float *tp=(float *)(uintptr_t)tg->rax;
+            if ((uintptr_t)tp>0x10000) {
+                const float tl=tp[4]*tp[4]+tp[5]*tp[5]+tp[6]*tp[6]+tp[7]*tp[7];
+                if (tl>0.98f && tl<1.02f && tp[0]>-100000.0f && tp[0]<100000.0f && tp[1]>-100000.0f && tp[1]<100000.0f && tp[2]>-100000.0f && tp[2]<100000.0f) {
+                    const float fw[3]={0.0f,0.0f,1.0f}; float f[3];
+                    quat_rotate(tp+4,fw,f);
+                    const float hp=SDL_atan2f(f[0],f[2])*57.29578f, ep=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
+                    const float dh=wrap_degrees(hp-u3_aim_last_heading), de=ep-u3_aim_last_elev;
+                    if (dh<90.0f && dh>-90.0f && u3_turn_pose(tp,u3_aim_pivot,dh,de) && mouse_debug()) printf("Mouse: U3 THROWFADE T=%.4f w=%.3f turned %.2f,%.2f (to %.2f,%.2f)\n",now_us()*1e-6,(double)tw,(double)dh,(double)de,(double)u3_aim_last_heading,(double)u3_aim_last_elev);
+                }
+            }
+        }
+    }
     if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && u3_aim_h0_ok && ((now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
         const int swap_only=u3_swap_press_us && now_us()-u3_swap_press_us<1500000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000);
         if (swap_only && !(u3_layer_us && now_us()-u3_layer_us<200000)) return;
@@ -4477,8 +4530,15 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
                 const float hp=SDL_atan2f(f[0],f[2])*57.29578f, ep=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
                 float own[3]={p[0],p[1],p[2]};   /* (no pivot known yet: the camera turns on the spot) */
                 if (swap_only) { for (int i=0;i<3;++i) own[i]=u3_aim_pivot[i]; }   /* (the shoulder switch: the player stays where he is, the camera turns about him) */
-                else u3_roll_pivot(p,1,own);
+                else {
+                    static int gp=-1; if (gp<0) { const char *e=getenv("BB_U3_GONEPIVOT"); gp=!(e && e[0]=='0'); }
+                    /* the grenade launcher (no roll): the same pivot as the throw fade and the pin (the player's pivot of the aim), or the position shifts by ~1 m each time the pivot changes (measured 2026-11-08 on the final pose: 0.8 m at the gone frame, 1.4 m back at the release). BB_U3_GONEPIVOT=0: the roll pivot as before */
+                    if (gp && !(u3_roll_press_us && now_us()-u3_roll_press_us<1500000)) { own[0]=u3_aim_pivot[0]; own[1]=u3_aim_pivot[1]; own[2]=u3_aim_pivot[2]; }
+                    else u3_roll_pivot(p,1,own);
+                }
                 if (mouse_debug() && swap_only) printf("Mouse: U3 SWAPTURN T=%.4f cam=%llx aimcam=%llx w=%.3f hp=%.2f -> %.2f swap_ms=%.0f total=%.2f h0=%.2f\n",now_us()*1e-6,(unsigned long long)r14,(unsigned long long)u3_probe_aim_cam,(double)*(const float *)(uintptr_t)(r14+0x108),(double)hp,(double)u3_layer_heading,(double)((now_us()-u3_swap_press_us)*1e-3),(double)u3_aim_total_yaw,(double)u3_aim_h0);
+                if (mouse_debug() && !swap_only) { float hry=0.0f; double hra=0.0; const int hh=bbgpu_camera_yaw(&hry,&hra); printf("Mouse: U3 HELDREND rend=%.2f\n",hh ? (double)hry : 999.0); }
+                if (mouse_debug() && !swap_only) printf("Mouse: U3 HELDLAYER T=%.4f cam=%llx w=%.3f hp=%.2f ep=%.2f last_h=%.2f last_e=%.2f total=%.2f/%.2f gone_ms=%.0f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)hp,(double)ep,(double)u3_aim_last_heading,(double)u3_aim_last_elev,(double)u3_aim_total_yaw,(double)u3_aim_total_pitch,(double)(u3_aim_frame_us ? (now_us()-u3_aim_frame_us)*1e-3 : -1.0));
                 if (swap_only) u3_turn_pose(p,own,wrap_degrees(hp-u3_layer_heading),ep-u3_layer_elev);
                 else u3_turn_pose(p,own,wrap_degrees(hp-u3_aim_last_heading),ep-u3_aim_last_elev);
                 if (mouse_debug() && swap_only) printf("Mouse: U3 SWFIN T=%.4f cam=%llx w=%.3f fin_pos=%.3f,%.3f,%.3f own=%.3f,%.3f,%.3f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)p[0],(double)p[1],(double)p[2],(double)own[0],(double)own[1],(double)own[2]);
@@ -4486,7 +4546,32 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
         }
         return;
     }
-    if (r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && now_us()-u3_aim_active_us<600000 && !(u3_hand_us>u3_aim_active_us+30000) && !(u3_cover_seen_us && now_us()-u3_cover_seen_us<2000000)) {
+    {   /* The end of the pin after a grenade throw: the game's own walking view is ~12 degrees off the pinned one (measured 2026-11-08: rendered -95.7 -> -107.5 in one frame when the pin let go). The difference seen at the first free frame is given back to the game's view over 0.35 s. BB_U3_PINTAIL=0: off */
+        static int pt=-1; if (pt<0) { const char *e=getenv("BB_U3_PINTAIL"); pt=!(e && e[0]=='0'); }
+        static uint64_t tail_key, tail_start; static float tail_r0;
+        const uint64_t tn=now_us();
+        uint64_t tvt=0;
+        if (pt && r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && tn-u3_aim_active_us>=600000 && tn-u3_aim_active_us<1500000 && u3_aim_active_us!=0 &&
+            !(u3_cover_seen_us && tn-u3_cover_seen_us<2000000) && safe_read(&tvt,r14,8) && tvt==runtime_image_base()+0x1671390 && (tail_key==u3_aim_active_us || u3_gone_pin())) {
+            const RuntimeGuestRegs *tg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            float *tp=(float *)(uintptr_t)tg->rax;
+            if ((uintptr_t)tp>0x10000) {
+                const float tl=tp[4]*tp[4]+tp[5]*tp[5]+tp[6]*tp[6]+tp[7]*tp[7];
+                if (tl>0.98f && tl<1.02f && tp[0]>-100000.0f && tp[0]<100000.0f && tp[1]>-100000.0f && tp[1]<100000.0f && tp[2]>-100000.0f && tp[2]<100000.0f) {
+                    const float fw[3]={0.0f,0.0f,1.0f}; float f[3];
+                    quat_rotate(tp+4,fw,f);
+                    const float hp=SDL_atan2f(f[0],f[2])*57.29578f;
+                    if (tail_key!=u3_aim_active_us) { tail_key=u3_aim_active_us; tail_start=tn; tail_r0=wrap_degrees(hp-u3_aim_last_heading); if (tail_r0>25.0f) tail_r0=25.0f; if (tail_r0<-25.0f) tail_r0=-25.0f; }
+                    const float k=(float)(tn-tail_start)*(1.0f/350000.0f);
+                    if (k<1.0f) {
+                        const float r=tail_r0*(1.0f-k);
+                        if (u3_turn_pose(tp,u3_aim_pivot,r,0.0f) && mouse_debug()) printf("Mouse: U3 PINTAIL T=%.4f turned %.2f (r0=%.2f k=%.2f)\n",tn*1e-6,(double)r,(double)tail_r0,(double)k);
+                    }
+                }
+            }
+        }
+    }
+    if (r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && now_us()-u3_aim_active_us<600000 && (!(u3_hand_us>u3_aim_active_us+30000) || u3_gone_pin()) && !(u3_cover_seen_us && now_us()-u3_cover_seen_us<2000000)) {
         /* The walking layers that fade in over the released aim carry the game's raw walking camera, whose position shown starts ~13 degrees off its direction and
          * relaxes (measured 2026-11-04 after the grenade launcher: the layers' own headings went to -78 while the picture was to stay at -66.5, the blend swung 6 degrees and
          * came back in 0.9 s). Once each of them is blended in, the picture is put back on the heading the aim ended at (u3_aim_last_heading), tilt left to the game.
@@ -4501,7 +4586,28 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
                 if (len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f) {
                     const float fwd[3]={0.0f,0.0f,1.0f}; float f[3];
                     quat_rotate(p+4,fwd,f);
+                    if (u3_gone_pin()) {   /* grenade launcher: the aiming camera went away before the release, the mouse moves while the pin holds: it turns the pinned heading (walking sensitivity), once a frame */
+                        static uint64_t gp_us; const uint64_t tn=now_us();
+                        if (!(gp_us && tn-gp_us<1500)) {
+                            float dx, dy; camera_take(2,&dx,&dy);
+                            u3_aim_total_yaw+=dx*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity;
+                            u3_aim_last_heading=wrap_degrees(u3_aim_h0-u3_aim_total_yaw);
+                            gp_us=tn;
+                        }
+                    }
                     const float hp=SDL_atan2f(f[0],f[2])*57.29578f, d=wrap_degrees(hp-u3_aim_last_heading);
+                    if (u3_gone_pin() && (d>0.05f ? d<40.0f : d>-40.0f)) {   /* the layer's camera is the walking camera itself: it is turned with the pose (the same turn about its pivot), or the pin ends 0.6 s later by a snap of the whole difference (measured 2026-11-08: 27 degrees in one frame). BB_U3_GONETURN=0: off */
+                        static int gt=-1; if (gt<0) { const char *e=getenv("BB_U3_GONETURN"); gt=!(e && e[0]=='0'); }
+                        float *od=(float *)(uintptr_t)(r14+0x78c0), *opos=(float *)(uintptr_t)(r14+0x7680); const float *opv=(const float *)(uintptr_t)(r14+0x78a0);
+                        static float gstep=-1.0f; if (gstep<0.0f) { const char *e=getenv("BB_U3_GONESTEP"); gstep=e ? (float)atof(e) : 3.0f; }   /* degrees per frame: the whole turn at once (27 degrees at the first frame) was a camera cut on screen, measured 2026-11-08 by screen recording */
+                        const float dd=(gstep>0.0f && d>gstep) ? gstep : (gstep>0.0f && d<-gstep) ? -gstep : d;
+                        const float a=dd*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
+                        const float px=opos[0]-opv[0], pz=opos[2]-opv[2], nx=opv[0]+px*c-pz*s, nz=opv[2]+px*s+pz*c, x=od[0], z=od[2];
+                        if (gt && a==a && nx>-100000.0f && nx<100000.0f && nz>-100000.0f && nz<100000.0f && x>-1.5f && x<1.5f && z>-1.5f && z<1.5f) {
+                            opos[0]=nx; opos[2]=nz; od[0]=x*c-z*s; od[2]=x*s+z*c;
+                            if (mouse_debug()) printf("Mouse: U3 GONETURN T=%.4f cam=%llx turned the walking camera %.2f degrees\n",now_us()*1e-6,(unsigned long long)r14,(double)d);
+                        }
+                    }
                     if (d>0.05f ? d<40.0f : d>-40.0f) { if (u3_turn_pose(p,u3_aim_pivot,d,0.0f) && mouse_debug()) printf("Mouse: U3 FADEWALK T=%.4f cam=%llx w=%.3f turned %.2f degrees (to %.2f)\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)d,(double)u3_aim_last_heading); }
                 }
             }
@@ -4573,6 +4679,12 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
     static int prev_held;
     if (now-last_us>50000 || (held && !prev_held)) {
         h0=hf; e0=ef;
+        {   /* Grenade launcher: the aiming camera comes back ~0.3 s after the throw (aim not held), after the "gone" branch has turned the layers: the picture it starts from already holds the whole turn, so the old total on top of the new h0 jumped the picture by 40-60 degrees (measured 2026-11-08). BB_U3_ROLLCONT=0 restores the old behaviour */
+            static int rc2=-1; if (rc2<0) { const char *e=getenv("BB_U3_ROLLCONT"); rc2=!(e && e[0]=='0'); }
+            if (rc2 && !held && !u3_aim_from_cover && u3_aim_frame_us && now>u3_aim_frame_us && now-u3_aim_frame_us>100000 && !(u3_roll_press_us && now-u3_roll_press_us<1500000) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+                u3_aim_total_yaw=u3_aim_total_pitch=0.0f; u3_aim_base_yaw=u3_aim_base_pitch=0.0f;
+            }
+        }
         /* A new press: this layer runs once BEFORE the aiming camera's update resets the totals (measured: 12 ms later), so the previous aim's totals showed
          * for a frame (elevation 80 on the first frame, the "jump" of the second press). The reset is made here too. */
         if (held && !prev_held && !u3_aim_from_cover) { u3_aim_total_yaw=u3_aim_total_pitch=0.0f; u3_aim_base_yaw=u3_aim_base_pitch=0.0f; }
@@ -4676,7 +4788,8 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
     }
     if (mouse_debug()) {   /* what is finally shown: position, heading and elevation of the pose written */
         const float fx=2.0f*(p[4]*p[6]+p[7]*p[5]), fy=2.0f*(p[5]*p[6]-p[7]*p[4]), fz=1.0f-2.0f*(p[4]*p[4]+p[5]*p[5]);
-        printf("Mouse: U3 wrote T=%.4f%s k=%.2f pos=%.3f,%.3f,%.3f h=%.2f e=%.2f cut=%d\n",now*1e-6,held ? "" : " FADE",(double)k,(double)p[0],(double)p[1],(double)p[2],(double)(SDL_atan2f(fx,fz)*57.29578f),(double)(SDL_asinf(fy>1.0f ? 1.0f : fy<-1.0f ? -1.0f : fy)*57.29578f),(int)(cut_us!=0));
+        float wry=0.0f; double wra=0.0; const int wh=bbgpu_camera_yaw(&wry,&wra);
+        printf("Mouse: U3 wrote T=%.4f%s k=%.2f pos=%.3f,%.3f,%.3f h=%.2f e=%.2f cut=%d rend=%.2f\n",now*1e-6,held ? "" : " FADE",(double)k,(double)p[0],(double)p[1],(double)p[2],(double)(SDL_atan2f(fx,fz)*57.29578f),(double)(SDL_asinf(fy>1.0f ? 1.0f : fy<-1.0f ? -1.0f : fy)*57.29578f),(int)(cut_us!=0),wh ? (double)wry : 999.0);
     }
 }
 static const unsigned char u3_layer_probe_code[]={0x48,0x81,0xc4,0x48,0x02,0x00,0x00,0x5b,0x41,0x5c,0x41,0x5d,0x41,0x5e,0x41,0x5f};
@@ -4766,6 +4879,10 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     }
     if (mouse_debug() && !(aim_held && u3_aim_seen_us && now-u3_aim_seen_us<150000)) { float wp[3]; if (safe_read(wp,camera+0x78a0,12)) { for (int i=0;i<3;++i) u3_dbg_walk_pivot[i]=wp[i]; u3_dbg_walk_us=now; } }
     if (aim_held && u3_aim_seen_us && now-u3_aim_seen_us<150000) return;
+    {   /* Grenade launcher: the aiming camera is gone 0.15 s but the aim is still "held" (the throw fade, up to ~0.75 s after the release). The walking camera must not take the mouse yet: queue 0 held the turns of the whole aim, which came out as one 27 degree turn of the walking camera at this frame (measured on the final pose 2026-11-08: a jump of ~1 m 0.6 s after the throw, undone ~0.2 s later by the pin). The queue is emptied instead. BB_U3_GONEDRAIN=0: off */
+        static int gd=-1; if (gd<0) { const char *e=getenv("BB_U3_GONEDRAIN"); gd=!(e && e[0]=='0'); }
+        if (gd && aim_held && !l2_held && u3_aim_active_us && now-u3_aim_active_us<2000000) { float ix, iy; camera_take(0,&ix,&iy); return; }
+    }
     if (u3_anim_layer_us && now-u3_anim_layer_us<50000) {   /* the ledge / climb camera holds the picture: the mouse is its, but the pitch is the arc of this camera */
         if (u3_walkturn_on() && now>=u3_walkturn_off_until) {   /* the mouse's turn the layer handed over, as the cumulative u3_anim_given: this camera catches up with what it has not had (a new walking camera comes while another is still shown) */
             int sl=-1;
@@ -7967,6 +8084,7 @@ static void sample(PadData *d) {
     d->buttons|=injected.buttons;
     /* L2 aims; L1 (grenade) aims with the same zoom camera, but only once that camera runs (L1 without a grenade does nothing) */
     l2_held=(d->buttons & BTN_L2)!=0;
+    l1_held=(d->buttons & BTN_L1)!=0;
     aim_held=l2_held || ((d->buttons & BTN_L1) && zoom_camera_us && now_us()-zoom_camera_us<100000) || (u2_zoom_top_us && now_us()-u2_zoom_top_us<100000) || (u3_turret_us && now_us()-u3_turret_us<100000);
     { static int prev_circle; const int c=(d->buttons & BTN_CIRCLE)!=0; if (c && !prev_circle && aim_held) u3_roll_press_us=now_us(); prev_circle=c; }   /* U3: the roll (Circle) pressed while aiming */
     { static int prev_l3; const int c=(d->buttons & BTN_L3)!=0; if (c && !prev_l3 && aim_held) u3_swap_press_us=now_us(); prev_l3=c; }   /* U3: the shoulder switch (L3) pressed while aiming */
