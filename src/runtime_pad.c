@@ -4799,12 +4799,18 @@ static uint64_t u3_exit_stick_us(void) { return 60000u; }
  * nobody turned meanwhile, drew the picture back and the mouse's movement died away to nothing (video: image motion down to 0 at the end of that
  * second, then back at once). So while the cover camera runs, the walking camera is put every frame on the heading and elevation the cover shows,
  * exactly as the release of an aim does it, and the transition has nothing to pull toward. */
+/* The arc the walking camera had when the cover was entered, and the last time it was under the cover's control. Measured 2026-11-08: it drifted from 0.48 to
+ * 0.70-0.76 under the cover, so the walking camera took over almost overhead and looked down, then swung back as soon as the mouse moved. */
+static float u3_cover_arc0; static uint64_t u3_cover_arc_us;
+static int u3_cover_arc_on(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_U3_COVERARC"); v=!(e && atoi(e)==0); } return v; }
 static void u3_walk_follow_cover(uint64_t camera, uint64_t now) {
     if (!(u3_cover_show_us && now-u3_cover_show_us<100000) || (u3_aim_active_us && u3_aim_active_us>u3_cover_show_us)) return;
     float dir[3], arc;
     if (!safe_read(dir,camera+0x78c0,12) || !safe_read(&arc,camera+0x7874,4)) return;
     const float len2=dir[0]*dir[0]+dir[2]*dir[2];
     if (!(len2>0.8f && len2<1.2f && dir[1]>-0.1f && dir[1]<0.1f && arc>-3.0f && arc<3.0f)) return;
+    if (now-u3_cover_arc_us>500000) u3_cover_arc0=arc;   /* (the cover has just been entered: the arc the walking camera had before it) */
+    u3_cover_arc_us=now;
     const float a=wrap_degrees(heading_of((const float *)(uintptr_t)(camera+0x78c0))-u3_cover_show_h)*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
     float *pos=(float *)(uintptr_t)(camera+0x7680), *d=(float *)(uintptr_t)(camera+0x78c0), *arcp=(float *)(uintptr_t)(camera+0x7874);
     const float *pivot=(const float *)(uintptr_t)(camera+0x78a0);
@@ -5078,7 +5084,9 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
         if (safe_read(fwd,camera+0x200,12)) {
             const float fl=SDL_sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);
             if (fl>0.9f && fl<1.1f) {
-                const float v=*arcp+0.5f*(SDL_asinf(fwd[1]/fl)*57.29578f-u3_tk_e)/105.0f;
+                const int back=u3_cover_arc_on() && now-u3_cover_arc_us<1500000 && u3_cover_arc0>=0.0f && u3_cover_arc0<=0.76f;
+                const float v=back ? u3_cover_arc0 : *arcp+0.5f*(SDL_asinf(fwd[1]/fl)*57.29578f-u3_tk_e)/105.0f;
+                if (mouse_debug()) printf("Mouse: U3 cover left: arc %.3f -> %.3f (before the cover %.3f, back=%d)\n",(double)*arcp,(double)v,(double)u3_cover_arc0,back);
                 if (v==v) *arcp=v<0.0f ? 0.0f : v>0.76f ? 0.76f : v;
             }
         }
