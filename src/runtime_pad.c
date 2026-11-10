@@ -3680,6 +3680,8 @@ static void __attribute__((ms_abi)) u3_cover_camera_seen(uint64_t out, uint64_t 
  * The position is pivot + R(q) * (-0.4, 0.475, -1.0) exactly (fit residual 1e-6): the shoulder rig, behind and beside the player's pivot. The game
  * works the output out again from its own state every frame, so the mouse's whole turn since the aim began is put on top of it each frame:
  * the quaternion turned about the world's up (yaw) and its own x (pitch), the position turned with it about the same pivot. BB_U3_NATIVE=0 turns it off. */
+static float u3_pose_k=-11.3f; static int u3_pose_k_n;   /* (the walking camera's pose heading minus its direction, degrees: read while it walks steadily, see u3_walk_camera) */
+static float u3_hold_h; static uint64_t u3_hold_us;   /* (the heading the picture was held on after an aim, see PINTAIL: a new aim started within 0.3 s starts from it) */
 static float u3_aim_h0, u3_aim_e0;   /* the heading / elevation the picture had at the start of the aim (set by u3_layer_blend, which is no longer called once the aim has faded in) */
 static float u3_aim_base_yaw, u3_aim_base_pitch;   /* the turn the aim started with from cover (the cover camera's), the mouse's own turn comes on top */
 static int u3_aim_from_cover, u3_aim_h0_ok;   /* the aim began in cover: its base heading is not the picture's, so the turn is kept absolute (h0 - total) after the fade-in too */
@@ -4662,7 +4664,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         static uint64_t tail_key, tail_start; static float tail_r0;
         const uint64_t tn=now_us();
         uint64_t tvt=0;
-        if (pt && r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && tn-u3_aim_active_us>=600000 && tn-u3_aim_active_us<1500000 && u3_aim_active_us!=0 &&
+        if (pt && r14 && r14!=u3_probe_aim_cam && !aim_held && u3_aim_active_us && u3_aim_h0_ok && tn-u3_aim_active_us>=600000 && tn-u3_aim_active_us<2000000 && u3_aim_active_us!=0 &&
             !(u3_cover_seen_us && tn-u3_cover_seen_us<2000000) && safe_read(&tvt,r14,8) && tvt==runtime_image_base()+0x1671390 && (tail_key==u3_aim_active_us || u3_gone_pin())) {
             const RuntimeGuestRegs *tg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
             float *tp=(float *)(uintptr_t)tg->rax;
@@ -4673,7 +4675,21 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
                     quat_rotate(tp+4,fw,f);
                     const float hp=SDL_atan2f(f[0],f[2])*57.29578f;
                     if (tail_key!=u3_aim_active_us) { tail_key=u3_aim_active_us; tail_start=tn; tail_r0=wrap_degrees(hp-u3_aim_last_heading); if (tail_r0>25.0f) tail_r0=25.0f; if (tail_r0<-25.0f) tail_r0=-25.0f; }
-                    const float k=(float)(tn-tail_start)*(1.0f/350000.0f);
+                    static int tail_old=-1; if (tail_old<0) { const char *e=getenv("BB_U3_PINTAIL_HOLD"); tail_old=!(e && e[0]=='1'); }
+                    /* (a small gap is given back over 0.9 s instead of 0.35 s: the same few tenths of a degree, no longer seen as a slide, 2026-11-10) */
+                    const float k=(float)(tn-tail_start)*(1.0f/((tail_r0<3.0f && tail_r0>-3.0f) ? 900000.0f : 350000.0f));
+                    /* (measured 2026-11-10: after an aim the game's raw walking view sits 6 to 9 degrees off the camera's direction (+0x78c0, the one that moves Drake) and joins it
+                     * by itself in ~1.2 s: easing to the raw view in 0.35 s slid the picture that far. The picture is now held on the direction until the raw view has joined it,
+                     * faded out over the last 0.4 s of the window. BB_U3_PINTAIL_OLD=1: the old 0.35 s ease) */
+                    if (!tail_old) {
+                        const float dh=heading_of((const float *)(uintptr_t)(r14+0x78c0));
+                        float r=wrap_degrees(hp-dh); if (r>25.0f) r=25.0f; if (r<-25.0f) r=-25.0f;
+                        const float left=(float)(2000000-(int64_t)(tn-u3_aim_active_us))*(1.0f/400000.0f);
+                        if (left<1.0f) r*=left<0.0f ? 0.0f : left;
+                        if (r!=r) r=0.0f;
+                        u3_hold_h=wrap_degrees(hp-r); u3_hold_us=tn;
+                        if ((r>0.05f || r<-0.05f) && u3_turn_pose(tp,u3_aim_pivot,r,0.0f) && mouse_debug()) printf("Mouse: U3 PINTAIL T=%.4f turned %.2f (hold on dir %.2f, raw %.2f)\n",tn*1e-6,(double)r,(double)dh,(double)hp);
+                    } else
                     if (k<1.0f) {
                         const float r=tail_r0*(1.0f-k);
                         if (u3_turn_pose(tp,u3_aim_pivot,r,0.0f) && mouse_debug()) printf("Mouse: U3 PINTAIL T=%.4f turned %.2f (r0=%.2f k=%.2f)\n",tn*1e-6,(double)r,(double)tail_r0,(double)k);
@@ -4790,6 +4806,13 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
     static int prev_held;
     if (now-last_us>50000 || (held && !prev_held)) {
         h0=hf; e0=ef;
+        {   /* (measured 2026-11-10: a new aim within 2 s of the last one started from the aiming camera's raw heading, 11 degrees off the picture PINTAIL was holding: the picture jumped that far at the press. It starts from the held heading. BB_U3_HOLDAIM=0: off) */
+            static int ha=-1; if (ha<0) { const char *e=getenv("BB_U3_HOLDAIM"); ha=(e && e[0]=='1'); }
+            if (ha && held && !prev_held && u3_hold_us && now>=u3_hold_us && now-u3_hold_us<300000) {
+                if (mouse_debug()) printf("Mouse: U3 AIMHOLD T=%.4f h0 %.2f -> %.2f\n",now*1e-6,(double)h0,(double)u3_hold_h);
+                h0=u3_hold_h;
+            }
+        }
         {   /* Grenade launcher: the aiming camera comes back ~0.3 s after the throw (aim not held), after the "gone" branch has turned the layers: the picture it starts from already holds the whole turn, so the old total on top of the new h0 jumped the picture by 40-60 degrees (measured 2026-11-08). BB_U3_ROLLCONT=0 restores the old behaviour */
             static int rc2=-1; if (rc2<0) { const char *e=getenv("BB_U3_ROLLCONT"); rc2=!(e && e[0]=='0'); }
             if (rc2 && !held && !u3_aim_from_cover && u3_aim_frame_us && now>u3_aim_frame_us && now-u3_aim_frame_us>100000 && !(u3_roll_press_us && now-u3_roll_press_us<1500000) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
@@ -4984,6 +5007,23 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     { float pv[3]; if (safe_read(pv,camera+0x78a0,12) && (pv[0]!=0.0f || pv[1]!=0.0f || pv[2]!=0.0f) && pv[0]>-100000.0f && pv[0]<100000.0f && pv[1]>-100000.0f && pv[1]<100000.0f && pv[2]>-100000.0f && pv[2]<100000.0f) { u3_walk_pivot_last[0]=pv[0]; u3_walk_pivot_last[1]=pv[1]; u3_walk_pivot_last[2]=pv[2]; u3_walk_pivot_ok=1; } }   /* (the V view replaces the walking camera and its object is zeroed: its last pivot is kept) */
     const uint64_t now=now_us();
     u3_walk_update_us=now;
+    if (!aim_held && (!u3_aim_active_us || now-u3_aim_active_us>2500000) && !(u3_cover_seen_us && now-u3_cover_seen_us<3000000)) {
+        /* (the pose's offset from the direction is the camera's own and depends on the setting, -11.4 degrees in the fights and -3.7 in the corridors, measured 2026-11-10: it is read here, the camera walking steadily and the mouse not turning it, and smoothed) */
+        float q4[4];
+        if (safe_read(q4,camera+0x130,16)) {
+            const float ql=q4[0]*q4[0]+q4[1]*q4[1]+q4[2]*q4[2]+q4[3]*q4[3];
+            if (ql>0.98f && ql<1.02f) {
+                const float fwz[3]={0.0f,0.0f,1.0f}; float fq[3];
+                quat_rotate(q4,fwz,fq);
+                const float km=wrap_degrees(SDL_atan2f(fq[0],fq[2])*57.29578f-heading_of((const float *)(uintptr_t)(camera+0x78c0)));
+                /* (only a reading that agrees with the previous one: the pose lags the direction while the mouse turns, and a camera made this frame carries a stale pose) */
+                static float prev_km=1000.0f;
+                const float dk=km-prev_km;
+                if (km>-25.0f && km<25.0f && (km>0.3f || km<-0.3f) && dk<0.4f && dk>-0.4f) { u3_pose_k = u3_pose_k_n ? u3_pose_k+0.1f*(km-u3_pose_k) : km; if (u3_pose_k_n<1000) ++u3_pose_k_n; }
+                prev_km=km;
+            }
+        }
+    }
     {   /* BB_U3_WALKPROBE=<file>: 0x300 bytes of the walking camera at +0x7600 on every update (time, camera, under-cover flag, bytes), to find the spring's speed field */
         static FILE *wf; static int winit; static unsigned wn;
         if (!winit) { winit=1; const char *p=getenv("BB_U3_WALKPROBE"); if (p && *p) wf=fopen(p,"wb"); }
@@ -4992,6 +5032,16 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
             const double pt=now*1e-6; const uint64_t pc=camera; const uint32_t cov=(u3_cover_seen_us && now-u3_cover_seen_us<u3_exit_stick_us()) ? 1u : 0u, pad=0;
             fwrite(&pt,8,1,wf); fwrite(&pc,8,1,wf); fwrite(&cov,4,1,wf); fwrite(&pad,4,1,wf); fwrite(wbuf,1,sizeof(wbuf),wf);
             if ((++wn&63)==0) fflush(wf);
+        }
+    }
+    {   /* BB_U3_WALKPROBE2=<file>: the output block (+0x100..+0x500) and the wide state (+0x7000..+0x8000) of the walking camera on every update: the raw heading's source is not in the 0x300 bytes above */
+        static FILE *wf2; static int winit2; static unsigned wn2;
+        if (!winit2) { winit2=1; const char *p=getenv("BB_U3_WALKPROBE2"); if (p && *p) wf2=fopen(p,"wb"); }
+        static unsigned char wbuf2a[0x400], wbuf2b[0x1000];
+        if (wf2 && wn2<3000 && safe_read(wbuf2a,camera+0x100,sizeof(wbuf2a)) && safe_read(wbuf2b,camera+0x7000,sizeof(wbuf2b))) {
+            const double pt=now*1e-6; const uint64_t pc=camera;
+            fwrite(&pt,8,1,wf2); fwrite(&pc,8,1,wf2); fwrite(wbuf2a,1,sizeof(wbuf2a),wf2); fwrite(wbuf2b,1,sizeof(wbuf2b),wf2);
+            if ((++wn2&31)==0) fflush(wf2);
         }
     }
     if (mouse_debug() && !(aim_held && u3_aim_seen_us && now-u3_aim_seen_us<150000)) { float wp[3]; if (safe_read(wp,camera+0x78a0,12)) { for (int i=0;i<3;++i) u3_dbg_walk_pivot[i]=wp[i]; u3_dbg_walk_us=now; } }
@@ -5128,21 +5178,80 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     { float ws[3]; if (safe_read(ws,camera+0x7680,12) && ws[0]>-100000.0f && ws[0]<100000.0f && ws[1]>-100000.0f && ws[1]<100000.0f && ws[2]>-100000.0f && ws[2]<100000.0f) { u3_walk_shown[0]=ws[0]; u3_walk_shown[1]=ws[1]; u3_walk_shown[2]=ws[2]; u3_walk_shown_us=now; } }
     /* (only while the aim layer still writes u3_aim_last_heading, ~0.5 s after the release: after that nothing updates it and the pin put the direction back on it every frame,
      * undoing the mouse's turn for the rest of the 1.5 s fade, measured 2026-11-04: direction frozen at -35.87 while the target went to -22, "something fights the rotation") */
-    if (!aim_held && u3_aim_active_us && now-u3_aim_active_us<1500000 && (u3_aim_total_yaw!=0.0f || u3_aim_total_pitch!=0.0f) && (!u3_layer_us || now-u3_layer_us<100000 || getenv("BB_U3_FADEPIN_OLD"))) {   /* (every frame of the fade: u3_layer_blend goes on turning the picture, this keeps the walking camera on it) */
+    static int aimalign_on=-1; if (aimalign_on<0) { const char *e=getenv("BB_U3_AIMALIGN"); aimalign_on=!(e && e[0]=='0'); }   /* (measured 2026-11-10: with no mouse turn during the aim the walking camera stayed ~9 degrees off the picture and PINTAIL slid the view there after 0.6 s; BB_U3_AIMALIGN=0 = old) */
+    if (!aim_held && u3_aim_active_us && now-u3_aim_active_us<1500000 && (aimalign_on || u3_aim_total_yaw!=0.0f || u3_aim_total_pitch!=0.0f) && (!u3_layer_us || now-u3_layer_us<100000 || getenv("BB_U3_FADEPIN_OLD"))) {   /* (every frame of the fade: u3_layer_blend goes on turning the picture, this keeps the walking camera on it) */
         /* The aim was let go: the walking camera, which stood still under the aiming one, is given the turn the mouse made meanwhile (direction, the
          * position shown turned about the pivot with it, and the arc), or the picture went back to where the aim began. */
         /* The game has already turned the walking camera by itself toward where Drake faces (measured: it was 85 degrees on its way when the turn was
          * added, which doubled it): it is put exactly on the heading the aim ended at, whatever it was. */
-        const float a=wrap_degrees(heading_of((const float *)(uintptr_t)(camera+0x78c0))-u3_aim_last_heading)*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
+        /* (measured 2026-11-10 with BB_U3_WALKPROBE2: the walking camera's final pose (quaternion +0x130) sits a constant ~11.3 degrees off its direction +0x78c0, at rest and walking
+         * alike (the camera looks past Drake's shoulder). The direction was put on the picture's heading, so the pose came out 11 degrees to one side of it after the handoff, whatever the
+         * mouse had turned: PINTAIL's r0, the slide ~0.7 s after the release, the jump at the next press. The direction is now put where the POSE lands on the picture.
+         * BB_U3_POSEK=<degrees> sets the offset, 0: the old behaviour) */
+        static float posek=1000.0f; static int posek_env; if (posek>999.0f) { const char *e=getenv("BB_U3_POSEK"); posek_env=e!=NULL; posek=e ? (float)atof(e) : -11.3f; }
+        static uint64_t k_key; static float k_used=-11.3f;
+        if (posek_env) k_used=posek;
+        else {
+            static float k_last; static int k_last_ok;   /* (what the loop below ended on at the last aim: the offset hardly changes from one aim to the next, so it starts there) */
+            if (k_key!=u3_aim_active_us) { k_key=u3_aim_active_us; k_used=k_last_ok ? k_last : (u3_pose_k_n ? u3_pose_k : posek); if (mouse_debug()) printf("Mouse: U3 POSEK start %.2f (read over %d frames)\n",(double)k_used,u3_pose_k_n); }
+            /* (measured 2026-11-10: the offset also changes with what Drake does, standing at the release and then running: a value read beforehand cannot hold. The pose the camera really carries
+             * (quaternion +0x130, one frame old) is compared with the picture, and the offset is trimmed slowly toward closing the gap; the pose follows the direction with a lag, so the gain stays low.
+             * BB_U3_POSEFB=0: off) */
+            static int fbon=-1; if (fbon<0) { const char *e=getenv("BB_U3_POSEFB"); fbon=!(e && e[0]=='0'); }
+            float q4[4];
+            if (fbon && safe_read(q4,camera+0x130,16)) {
+                const float ql=q4[0]*q4[0]+q4[1]*q4[1]+q4[2]*q4[2]+q4[3]*q4[3];
+                if (ql>0.98f && ql<1.02f) {
+                    const float fwz[3]={0.0f,0.0f,1.0f}; float fq[3];
+                    quat_rotate(q4,fwz,fq);
+                    const float e=wrap_degrees(SDL_atan2f(fq[0],fq[2])*57.29578f-u3_aim_last_heading);
+                    static uint64_t fb_first_key; const int fb_first=(fb_first_key!=u3_aim_active_us); fb_first_key=u3_aim_active_us;   /* (the first reading of an aim comes from a camera made this frame whose pose is the aiming camera's: +11.5 almost every time, measured 2026-11-10, it pushed the loop the wrong way) */
+                    /* (measured 2026-11-10 in the fade after a release: k had settled (-14.4, pose-picture ~0) and then a fresh walking camera / transient gave readings of +19, -14, -7 for ~0.3 s, which dragged k to +2.5 or -23 and PINTAIL then slid the view 4-5 degrees.
+                     * Once 4 readings of this aim are in, a reading further than 8 degrees is not trusted and k is held for 0.15 s after it; if it lasts 0.4 s it is taken as real. BB_U3_POSEGATE=0: off) */
+                    static int gate_on=-1; if (gate_on<0) { const char *ge=getenv("BB_U3_POSEGATE"); gate_on=!(ge && ge[0]=='0'); }
+                    static int fb_n; static uint64_t fb_hold, fb_out_since;
+                    if (fb_first) { fb_n=0; fb_hold=0; fb_out_since=0; }
+                    int fb_skip=0;
+                    if (gate_on && !fb_first) {
+                        if (fb_n>=4 && (e>8.0f || e<-8.0f)) { if (!fb_out_since) fb_out_since=now; if (now-fb_out_since<400000) { fb_skip=1; fb_hold=now+150000; } }
+                        else if (now<fb_hold) fb_skip=1;
+                        else fb_out_since=0;
+                    }
+                    /* (measured 2026-11-10: the pose reaches its final heading with a lag, so pose-picture read mid-way was +0.3 while it was heading for -1.4: k went the wrong way (-11 to -9.9, real -11.4) and the view slid ~2 degrees
+                     * right after the release. The reading is led by the pose's own speed (smoothed) so the loop aims at where the pose is going. BB_U3_POSELEAD=0: off) */
+                    static int lead_on=-1; if (lead_on<0) { const char *le=getenv("BB_U3_POSELEAD"); lead_on=(le && le[0]=='1'); }   /* (off by default: measured 2026-11-10 the rate was dominated by the loop's own convergence from the fresh-camera reading, lead sat at -3 and PINTAIL r0 rose to +1..+2 degrees) */
+                    static float lead_pe, lead_rate; static uint64_t lead_pt;
+                    if (fb_first) { lead_pe=e; lead_pt=now; lead_rate=0.0f; }
+                    else if (now>lead_pt) { const float dt=(float)(now-lead_pt)*1e-6f; if (dt>0.002f && dt<0.1f) lead_rate+=0.25f*((e-lead_pe)/dt-lead_rate); lead_pe=e; lead_pt=now; }
+                    float lead=(lead_on && fb_n>=3) ? 0.35f*lead_rate : 0.0f; if (lead>3.0f) lead=3.0f; if (lead<-3.0f) lead=-3.0f;
+                    const float ee=e+lead;
+                    if (mouse_debug() && !fb_first) { static uint64_t lp; if (now-lp>100000) { lp=now; printf("Mouse: U3 POSELEAD T=%.4f e=%.2f rate=%.2f lead=%.2f\n",now*1e-6,(double)e,(double)lead_rate,(double)lead); } }
+                    if (!fb_first && !fb_skip && e>-30.0f && e<30.0f) { fb_n++; k_used+=(ee>-4.0f && ee<4.0f ? 0.14f : 0.12f)*ee; if (k_used>30.0f) k_used=30.0f; if (k_used<-30.0f) k_used=-30.0f; k_last=k_used; k_last_ok=1; }
+                    if (mouse_debug()) { static uint64_t fbp; if (now-fbp>100000) { fbp=now; printf("Mouse: U3 POSEFB T=%.4f pose-picture=%.2f k=%.2f\n",now*1e-6,(double)e,(double)k_used); } }
+                }
+            }
+        }
+        const float a=wrap_degrees(heading_of((const float *)(uintptr_t)(camera+0x78c0))-u3_aim_last_heading+k_used)*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
         float *pos=(float *)(uintptr_t)(camera+0x7680);
         const float *pivot=(const float *)(uintptr_t)(camera+0x78a0);
         const float px=pos[0]-pivot[0], pz=pos[2]-pivot[2];
         const float nx=pivot[0]+px*c-pz*s, nz=pivot[2]+px*s+pz*c;
-        if (nx>-100000.0f && nx<100000.0f && nz>-100000.0f && nz<100000.0f) { pos[0]=nx; pos[2]=nz; }
+        /* (test 2026-11-10: the position shown is no longer turned here, only the direction: turning it without the spring's own state left the walking camera ~11 degrees off its direction
+         * for good, a lateral pan behind Drake then a jump when the hold let go; the pad has none. BB_U3_AIMPOS=1: the old rotation) */
+        static int aimpos_old=-1; if (aimpos_old<0) { const char *e=getenv("BB_U3_AIMPOS"); aimpos_old=!(e && e[0]=='0'); }
+        if (aimpos_old && nx>-100000.0f && nx<100000.0f && nz>-100000.0f && nz<100000.0f) { pos[0]=nx; pos[2]=nz; }
         float *d=(float *)(uintptr_t)(camera+0x78c0), *arcp=(float *)(uintptr_t)(camera+0x7874);
         const float x=d[0], z=d[2];
         d[0]=x*c-z*s; d[2]=x*s+z*c;
         (void)arcp;
+        {   /* (measured 2026-11-10: the walking layer's raw heading is the azimuth of the shown position -> the target +0x7650 (within 1 degree), the target lying only ~0.3 m
+             * from it, 6 to 9 degrees off the direction: PINTAIL then slid the view that far after 0.6 s. The position is put on the direction's line from the target, at the
+             * same distance. BB_U3_AIMTGT=0: off) */
+            static int al2=-1; if (al2<0) { const char *e=getenv("BB_U3_AIMTGT"); al2=(e && e[0]=='1'); }
+            const float *tg=(const float *)(uintptr_t)(camera+0x7650);
+            const float dl=SDL_sqrtf(d[0]*d[0]+d[2]*d[2]), ex=tg[0]-pos[0], ez=tg[2]-pos[2], el=SDL_sqrtf(ex*ex+ez*ez);
+            if (al2 && dl>0.1f && el>0.02f && el<3.0f && tg[0]>-100000.0f && tg[0]<100000.0f && tg[2]>-100000.0f && tg[2]<100000.0f) { pos[0]=tg[0]-d[0]/dl*el; pos[2]=tg[2]-d[2]/dl*el; }
+        }
         static uint64_t last_handoff_us;
         if (now-last_handoff_us>300000) u3_pitch_fix_until_us=now+500000;
         last_handoff_us=now;
@@ -5154,11 +5263,15 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
          * past it). */
         float *arcp=(float *)(uintptr_t)(camera+0x7874);
         float fwd[3];
-        if (safe_read(fwd,camera+0x200,12)) {   /* the look direction the walking camera gave last frame (the camera object keeps its output at +0x1f0, direction at +0x200 as the aiming camera does) */
+        /* (measured 2026-11-10: camera+0x200 always reads (x,0,z), an elevation of exactly 0, whatever the picture's tilt: the feedback below then
+         * pushed the arc to a stop every time the aim was let go, view plunging or rising. Off by default; BB_U3_AIMARC=1 = the old behaviour) */
+        static int aimarc_old=-1; if (aimarc_old<0) { const char *e=getenv("BB_U3_AIMARC"); aimarc_old=(e && atoi(e)==1); }
+        if (aimarc_old && safe_read(fwd,camera+0x200,12)) {   /* the look direction the walking camera gave last frame (the camera object keeps its output at +0x1f0, direction at +0x200 as the aiming camera does) */
             const float fl=SDL_sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]);
             if (fl>0.9f && fl<1.1f) {
                 const float walk_elev=SDL_asinf(fwd[1]/fl)*57.29578f;
                 const float v=*arcp+0.5f*(walk_elev-u3_aim_last_elev)/105.0f;
+                if (mouse_debug()) printf("Mouse: U3 AIMARC T=%.4f arc=%.4f walk_elev=%.2f last_elev=%.2f err=%.2f fwd=%.3f,%.3f,%.3f window=%d fix=%d\n",now*1e-6,(double)*arcp,(double)walk_elev,(double)u3_aim_last_elev,(double)(walk_elev-u3_aim_last_elev),(double)fwd[0],(double)fwd[1],(double)fwd[2],(int)u3_aim_fade_window(now),(int)(now<u3_pitch_fix_until_us));
                 if (v==v) *arcp=v<0.0f ? 0.0f : v>0.76f ? 0.76f : v;
                 if (u3_aim_fade_window(now)) {
                     /* The game's spring takes ~1 s to bring the picture's tilt to the arc: at the cut from the aiming camera (~0.5 s after the release) the
@@ -5209,7 +5322,11 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     follow_camera(camera,0x78c0,0x7874,105.0f,0,0);
     follow_arc_max=1.0f;
     if (mouse_debug()) { static uint64_t arc_us; if (now-arc_us>20000) { arc_us=now; { const float *vp=(const float *)(uintptr_t)(camera+0x7680), *vv=(const float *)(uintptr_t)(camera+0x78a0), *vt=(const float *)(uintptr_t)(camera+0x7650);
-      printf("Mouse: U3 ARC t=%.4f before=%.4f after=%.4f mouse=%d pos_dy=%.3f tgt_dy=%.3f h=%.3f piv_y=%.3f\n",now*1e-6,(double)arc0,(double)*(const float *)(uintptr_t)(camera+0x7874),follow_arc_moved,(double)(vp[1]-vv[1]),(double)(vt[1]-vv[1]),(double)SDL_sqrtf((vp[0]-vv[0])*(vp[0]-vv[0])+(vp[2]-vv[2])*(vp[2]-vv[2])),(double)vv[1]); } } }
+      printf("Mouse: U3 ARC t=%.4f before=%.4f after=%.4f mouse=%d pos_dy=%.3f tgt_dy=%.3f h=%.3f piv_y=%.3f\n",now*1e-6,(double)arc0,(double)*(const float *)(uintptr_t)(camera+0x7874),follow_arc_moved,(double)(vp[1]-vv[1]),(double)(vt[1]-vv[1]),(double)SDL_sqrtf((vp[0]-vv[0])*(vp[0]-vv[0])+(vp[2]-vv[2])*(vp[2]-vv[2])),(double)vv[1]);
+      { const float *dr=(const float *)(uintptr_t)(camera+0x78c0);   /* (azimuths, degrees: direction, shown position -> target, shown position -> pivot, pivot -> position) */
+        printf("Mouse: U3 AZ t=%.4f dir=%.2f pos_to_tgt=%.2f pos_to_piv=%.2f piv_to_pos=%.2f dist_tgt=%.2f dist_piv=%.2f aim_last=%.2f\n",now*1e-6,(double)heading_of(dr),
+               (double)(SDL_atan2f(vt[0]-vp[0],vt[2]-vp[2])*57.29578f),(double)(SDL_atan2f(vv[0]-vp[0],vv[2]-vp[2])*57.29578f),(double)(SDL_atan2f(vp[0]-vv[0],vp[2]-vv[2])*57.29578f),
+               (double)SDL_sqrtf((vt[0]-vp[0])*(vt[0]-vp[0])+(vt[2]-vp[2])*(vt[2]-vp[2])),(double)SDL_sqrtf((vv[0]-vp[0])*(vv[0]-vp[0])+(vv[2]-vp[2])*(vv[2]-vp[2])),(double)u3_aim_last_heading); } } } }
     if (u3_tk_key && u3_tk_key==u3_cover_seen_us && arc0==arc0) {   /* (the tilt the mouse added this frame: 105 degrees per unit of arc) */
         const float da=*(const float *)(uintptr_t)(camera+0x7874)-arc0;
         if (da>-0.5f && da<0.5f) u3_tk_e-=da*105.0f;   /* (more arc = camera higher = looks further down) */
