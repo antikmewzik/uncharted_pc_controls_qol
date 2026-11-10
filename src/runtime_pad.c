@@ -3698,6 +3698,8 @@ static float u3_aim_pivot[3];   /* the player's pivot, as worked out from the ai
 static float u3_anim_h;   /* U3: the heading the ledge / climb camera's layer left the picture at (degrees), handed to the walking camera when it comes back */
 static uint64_t u3_anim_layer_us;   /* U3: when the ledge / climb camera's layer last held the picture (the walking camera's update, which runs on, leaves the mouse to it) */
 static uint64_t u3_walk_update_us;   /* U3: when the walking camera's update last ran (it stops while a scripted camera, e.g. following Sully in chapter 2, holds the picture) */
+static float u3_walk_pivot_last[3]; static int u3_walk_pivot_ok;   /* the walking camera's pivot (+0x78a0) as of its last update: the player's, the V view turns about it */
+static float u3_aim_drake_off[2];   /* U3 aim: horizontal (x, z) gap from the pivot worked out from the aiming output to the player (the game turns its aim about the player: measured 2026-11-09, 0.42 m off with the fixed shoulder offset, the camera-to-player distance then varied 0.66-1.54 m), added to the pivot at each new aim; zeroed by a shoulder switch (its calibration puts the pivot where it was) */
 static float u3_dbg_walk_pivot[3]; static uint64_t u3_dbg_walk_us;   /* (diagnostic) the walking camera's pivot at its last update, read in u3_walk_camera */
 static float u3_aim_keep_yaw, u3_aim_keep_pitch;   /* the turn at the release, kept on the aiming camera while it fades out */
 static void quat_rotate(const float *q, const float *v, float *r) {   /* q v q^-1 */
@@ -3710,13 +3712,22 @@ static void quat_rotate(const float *q, const float *v, float *r) {   /* q v q^-
  * instance (and every switch) put the pivot, worked out with that fixed s, up to ~1 m off (measured 2026-10-31: the position jumped 0.6-1.1 m in height at each L3,
  * none without our camera). The player does not move at a switch: the pivot of the frame before the press is kept for 0.7 s and each instance's s is worked out so
  * that it falls on it. */
+/* The offset depends on the weapon (measured 2026-11-10 against the pad, player standing still): one-handed (pistol) the camera is 1.08 m from him horizontally,
+ * two-handed (AK) 1.5 m, local (-0.54, -1.43) for the left shoulder. With the pistol's s on a two-handed weapon the pivot was 0.4 m off the player and the camera went
+ * 0.69-1.5 m away from him in a full turn (the pad: 1.5 constant). No weapon field is known: at each new aim the candidate whose pivot falls nearest the walking camera's
+ * pivot (the player's, as of the press) is taken, the previous one being kept unless another is clearly nearer. The right shoulder of the two-handed weapon is a guess
+ * (the pistol's right is (0.3, 0.5, -1)): a shoulder switch measures it. */
+static const float u3_s_cand[4][3]={{-0.4f,0.475f,-1.0f},{0.3f,0.5f,-1.0f},{-0.54f,0.475f,-1.43f},{0.41f,0.5f,-1.43f}};
+static int u3_s_pick; static unsigned u3_s_epoch=1;
+static uint64_t u3_aim_pivot_us;   /* when u3_aim_pivot was last set by the aiming output */
 static const float *u3_shoulder_for(uint64_t cam, const float *o, uint64_t now) {
-    static struct { uint64_t cam, us; float s[3]; } slot[2];
+    static struct { uint64_t cam, us; float s[3]; unsigned cal; int cls; } slot[2];
     static float hold[3]; static uint64_t hold_key;
-    const float def[3]={-0.4f,0.475f,-1.0f};
+    int cls=u3_s_pick&~1;   /* the weapon of THIS camera: two cameras (the old weapon's fading out, the new one's) can be updated in the same frame, each has its own field of view (+0xc0: 45 two-handed, 55 one-handed) */
+    { float fov; if (cam && safe_read(&fov,cam+0xc0,4) && fov>20.0f && fov<100.0f) cls=fov<50.0f ? 2 : 0; }
     int k=-1;
     for (int i=0;i<2;++i) if (slot[i].cam==cam) k=i;
-    if (k<0) { k=slot[0].us<=slot[1].us ? 0 : 1; slot[k].cam=cam; for (int i=0;i<3;++i) slot[k].s[i]=def[i]; }
+    if (k<0) { k=slot[0].us<=slot[1].us ? 0 : 1; slot[k].cam=cam; slot[k].cal=0; }
     slot[k].us=now;
     if (u3_swap_press_us && now-u3_swap_press_us<700000) {
         if (hold_key!=u3_swap_press_us) { hold_key=u3_swap_press_us; for (int i=0;i<3;++i) hold[i]=u3_aim_pivot[i]; }
@@ -3725,10 +3736,27 @@ static const float *u3_shoulder_for(uint64_t cam, const float *o, uint64_t now) 
         quat_rotate(conj,d,s);
         if (s[0]>-2.0f && s[0]<2.0f && s[1]>-2.0f && s[1]<2.0f && s[2]>-3.0f && s[2]<0.0f) {
             for (int i=0;i<3;++i) slot[k].s[i]=s[i];
+            slot[k].cal=u3_s_epoch; slot[k].cls=cls;
+            u3_s_pick=(u3_s_pick&~1)|(s[0]>0.0f ? 1 : 0);   /* (the shoulder side the switch measured: a weapon change after it starts from the right candidate) */
+            u3_aim_drake_off[0]=u3_aim_drake_off[1]=0.0f;
             if (mouse_debug()) printf("Mouse: U3 SHOULDER T=%.4f cam=%llx s=%.3f,%.3f,%.3f swap_ms=%.0f\n",now*1e-6,(unsigned long long)cam,(double)s[0],(double)s[1],(double)s[2],(double)((now-u3_swap_press_us)*1e-3));
         }
     }
-    return slot[k].s;
+    if (!(slot[k].cal==u3_s_epoch && slot[k].cls==cls) && u3_aim_pivot_us && now>u3_aim_pivot_us && now-u3_aim_pivot_us<200000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+        /* The field of view and the rig do not change in the same frame at a weapon change (one frame of the wrong offset = a 0.43 m pop, measured): while the aim goes on the player stays put, so the weapon whose offset gives the pivot nearest the one of the last frame is taken (the field of view only decides when both are as near). */
+        static int gm=-1; if (gm<0) { const char *e=getenv("BB_U3_GEOMCLS"); gm=!(e && e[0]=='0'); }
+        if (gm) {
+            float d[2];
+            for (int c=0;c<2;++c) {
+                float off_c[3];
+                quat_rotate(o+4,u3_s_cand[c*2+(u3_s_pick&1)],off_c);
+                const float gx=o[0]-off_c[0]-u3_aim_pivot[0], gz=o[2]-off_c[2]-u3_aim_pivot[2];
+                d[c]=SDL_sqrtf(gx*gx+gz*gz);
+            }
+            if (d[0]>d[1]+0.1f) cls=2; else if (d[1]>d[0]+0.1f) cls=0;
+        }
+    }
+    return slot[k].cal==u3_s_epoch && slot[k].cls==cls ? slot[k].s : u3_s_cand[cls+(u3_s_pick&1)];
 }
 /* A shoulder switch restarts the aiming camera from the pose we left in its output (turned by the whole mouse turn): its raw pose then already has the turn and our total
  * counted it twice (measured 2026-10-31: the raw elevation fell from 59.6 to 23.6 at the press, the total was clamped to raw - 80 = -20.4, so one way up/down stayed blocked and the
@@ -3796,6 +3824,33 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         u3_aim_total_pitch+=(input.mouse_invert_y ? -dy : dy)*MOUSE_DEGREES_PER_PIXEL*input.mouse_sensitivity*input.mouse_aim_sensitivity;
         u3_aim_frame_us=now;
     }
+    {   /* a new aim: which weapon's shoulder offset? (see u3_s_cand) */
+        static int sp=-1; if (sp<0) { const char *e=getenv("BB_U3_SPICK"); sp=!(e && e[0]=='0'); }   /* BB_U3_SPICK=0: always the pistol's left, as before */
+        if (!blending_out && was_out && sp && u3_walk_pivot_ok && !(u3_turret_us && now-u3_turret_us<100000)) {
+            float gap[4], best=1e9f; int bi=0;
+            for (int c=0;c<4;++c) {
+                float off_c[3];
+                quat_rotate(o+4,u3_s_cand[c],off_c);
+                const float gx=o[0]-off_c[0]-u3_walk_pivot_last[0], gz=o[2]-off_c[2]-u3_walk_pivot_last[2];
+                gap[c]=SDL_sqrtf(gx*gx+gz*gz);
+                if (gap[c]<best) { best=gap[c]; bi=c; }
+            }
+            int pick=u3_s_pick;
+            float fov=0.0f;
+            if (r14 && safe_read(&fov,r14+0xc0,4) && fov>20.0f && fov<100.0f) {
+                /* the weapon: the aiming camera's field of view at its first frame (+0xc0) is 45 for the AK, 55 for the pistol (measured 2026-11-10, identical every aim); the gap to the walking camera's pivot is stale after a walk (0.3-0.5 m) and cannot tell the weapons apart, it only chooses the shoulder, which changes at a switch only */
+                const int cls=fov<50.0f ? 2 : 0, cur_side=u3_s_pick&1;
+                const int other=cls+(cur_side^1), same=cls+cur_side;
+                pick=same;
+                if (u3_walk_pivot_ok && gap[other]+0.25f<gap[same]) pick=other;
+                if (mouse_debug()) printf("Mouse: U3 SPICK fov=%.1f class=%d\n",(double)fov,cls);
+            }
+            else if (best<0.9f && gap[u3_s_pick]>best+0.10f) pick=bi;   /* (no field of view: the nearest candidate; a pivot more than 0.9 m from the walking camera's is a stale walking camera: nothing is learned) */
+            if (mouse_debug()) printf("Mouse: U3 SPICK T=%.4f gaps pistolL=%.2f pistolR=%.2f akL=%.2f akR=%.2f prev=%d pick=%d\n",now*1e-6,(double)gap[0],(double)gap[1],(double)gap[2],(double)gap[3],u3_s_pick,pick);
+            if (pick!=u3_s_pick) { u3_s_pick=pick; ++u3_s_epoch; }   /* (a shoulder measured at a switch belonged to the old weapon) */
+        }
+        /* (a weapon change with the aim held has no first frame: u3_shoulder_for reads the field of view of each camera on every frame) */
+    }
     const float look[3]={0.0f,0.0f,1.0f};
     static const float turret_shoulder[3]={0.0f,0.0f,-2.33f};   /* (turret camera: orbit centre 2.33 m straight ahead) */
     const float *shoulder=u3_turret_us && now-u3_turret_us<100000 ? turret_shoulder : u3_shoulder_for(r14,o,now);
@@ -3822,7 +3877,53 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     float off[3], pivot[3];
     quat_rotate(o+4,shoulder,off);
     for (int i=0;i<3;++i) pivot[i]=o[i]-off[i];
-    if (!blending_out) for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i];
+    if (!blending_out) {
+        static int ap=-1; if (ap<0) { const char *e=getenv("BB_U3_AIMPIVOT"); ap=(e && e[0]=='1'); }   /* BB_U3_AIMPIVOT=1: shift the pivot onto the walking camera's pivot at the press (off by default: after a walk that pivot lags behind the player, the gap measured was 0.2-0.8 m and the game's own pivot settles onto him) */
+        if (was_out) {   /* a new aim: the gap to the player (the walking camera's pivot, as of its last update) is measured on the game's own, still untouched, output */
+            u3_aim_drake_off[0]=u3_aim_drake_off[1]=0.0f;
+            if (ap && u3_walk_pivot_ok) {
+                const float gx=u3_walk_pivot_last[0]-pivot[0], gz=u3_walk_pivot_last[2]-pivot[2];
+                /* (after a walk the game's pivot is 0.7-0.9 m ahead of the player, measured 2026-11-10; a walking camera's pivot far older than that, teleport or scripted scene, is not the player's) */
+                if (gx*gx+gz*gz<4.0f) { u3_aim_drake_off[0]=gx; u3_aim_drake_off[1]=gz; }
+                if (mouse_debug()) printf("Mouse: U3 AIMPIVOT T=%.4f gap to player %.3f,%.3f (%s)\n",now*1e-6,(double)gx,(double)gz,gx*gx+gz*gz<4.0f ? "applied" : "too far, ignored");
+            }
+        }
+    }
+    pivot[0]+=u3_aim_drake_off[0]; pivot[2]+=u3_aim_drake_off[1];   /* (also while the aim fades out: the turn it kept is about the same pivot) */
+    int hold_fresh=0;
+    {   /* A camera that appears with the aim already held (weapon change) starts from a pose coming from ~3 m away: the pivot worked out from it jumps 0.45 m for a few frames and the picture goes away and comes back (measured 2026-11-10; the pad does not read the pivot). Until it has settled (0.5 s) the pivot of the aim in progress is kept; the camera's offset from it is then whatever the raw pose gives. */
+        static int fh=-1; if (fh<0) { const char *e=getenv("BB_U3_FRESHHOLD"); fh=!(e && e[0]=='0'); }   /* BB_U3_FRESHHOLD=0: off */
+        static struct { uint64_t cam, first, last; } seen[4];
+        int k=-1;
+        for (int i=0;i<4;++i) if (seen[i].cam==r14) k=i;
+        if (k<0) { k=0; for (int i=1;i<4;++i) if (seen[i].last<seen[k].last) k=i; seen[k].cam=r14; seen[k].first=now; seen[k].last=0; }
+        const int fresh=seen[k].last==0 || now-seen[k].last>300000;
+        if (fresh) seen[k].first=now;
+        seen[k].last=now;
+        static uint64_t aim_began; if (was_out) aim_began=now;
+        if (fh && !blending_out && !was_out && seen[k].first>aim_began+100000 && now-seen[k].first<500000 && u3_aim_active_us && now-u3_aim_active_us<300000 && u3_aim_frame_us && now-u3_aim_frame_us<300000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+            for (int i=0;i<3;++i) pivot[i]=u3_aim_pivot[i];
+            hold_fresh=1;   /* (its raw position is the old output, already turned, with the new base's heading: turning it again threw it to the other side of the player, 0.4 + 0.9 m in two frames, measured: the weapon's own shoulder offset is used instead) */
+            if (mouse_debug()) { static uint64_t pu; if (now-pu>100000) { pu=now; printf("Mouse: U3 FRESHHOLD T=%.4f cam=%llx age=%.0fms pivot kept\n",now*1e-6,(unsigned long long)r14,(double)(now-seen[k].first)*1e-3); } }
+        }
+    }
+    if (!blending_out) { for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i]; u3_aim_pivot_us=now; }
+    if (mouse_debug() && !blending_out && r14) {   /* (diagnostic, BB_U3_AIMDUMP=1) the aiming camera's object at the start of an aim and 1.2 s later: looking for the player's live position in it */
+        static int dd=-1; if (dd<0) { const char *e=getenv("BB_U3_AIMDUMP"); dd=(e && e[0]=='1'); }
+        static uint64_t t0; static int done;
+        if (dd) {
+            if (was_out) { t0=now; done=0; }
+            const int phase=(was_out ? 1 : (!done && t0 && now-t0>1200000 ? 2 : 0));
+            if (phase) {
+                done=(phase==2);
+                float buf[384];
+                if (safe_read(buf,r14,sizeof buf)) {
+                    printf("Mouse: U3 DUMP phase=%d T=%.4f cam=%llx rawpiv_shifted=%.3f,%.3f,%.3f walk=%.3f,%.3f,%.3f\n",phase,now*1e-6,(unsigned long long)r14,(double)pivot[0],(double)pivot[1],(double)pivot[2],(double)u3_walk_pivot_last[0],(double)u3_walk_pivot_last[1],(double)u3_walk_pivot_last[2]);
+                    for (int i=0;i<384;i+=8) printf("Mouse: U3 DUMPF %d phase=%d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",i*4,phase,(double)buf[i],(double)buf[i+1],(double)buf[i+2],(double)buf[i+3],(double)buf[i+4],(double)buf[i+5],(double)buf[i+6],(double)buf[i+7]);
+                }
+            }
+        }
+    }
     if (mouse_debug() && !blending_out) {   /* (diagnostic) is the pivot on the player? the walking camera's pivot is, at its last update before the aim */
         static uint64_t dbg_us;
         if (now-dbg_us>500000 || was_out) {
@@ -3863,7 +3964,12 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     const float n=SDL_sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
     if (!(n>0.5f)) return;
     for (int i=0;i<4;++i) q[i]/=n;
-    quat_rotate(q,shoulder,off);
+    {   /* (the pivot is now the player's, not the one the shoulder offset gives: the camera's offset from it, in the camera's own frame, is what turns; with no turn the output is the game's own position) */
+        const float conj_o[4]={-o[4],-o[5],-o[6],o[7]}, d[3]={o[0]-pivot[0],o[1]-pivot[1],o[2]-pivot[2]};
+        float s_eff[3];
+        quat_rotate(conj_o,d,s_eff);
+        quat_rotate(q,hold_fresh ? shoulder : s_eff,off);
+    }
     {
         float ff[3];
         quat_rotate(q,look,ff);
@@ -3910,7 +4016,6 @@ static int u3_turn_pose(float *p, const float *pivot, float yaw, float pitch) {
  * pose is then kept by the layer stack), so the mouse turns the final pose at the layer hook, like the cover: the total turn since V began is applied to
  * the pose the game gives each frame (yaw about the world up, pitch about the pose's side), about the pose's own position (the view stays at the head).
  * The mouse is taken natively (queue 2, fed while R3 is held and for ~1.3 s after), so it no longer goes through the emulated stick. */
-static float u3_walk_pivot_last[3]; static int u3_walk_pivot_ok;   /* its pivot (+0x78a0) as of its last update: the player's, the V view turns about it */
 static void u3_look_layer(uint64_t r14, uint64_t image) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -4501,8 +4606,14 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
             }
         }
     }
-    if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && u3_aim_h0_ok && ((now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
-        const int swap_only=u3_swap_press_us && now_us()-u3_swap_press_us<1500000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000);
+    int aim_other=0;   /* a weapon change with the aim held: the new weapon's aiming camera is a second instance of the aiming class, it fades in (w 0 -> 1 in 0.35 s) with the game's own base heading (measured 2026-11-10: 35 -> -116 degrees against the 42.6 we show) and the blend swings the picture and brings it back. It gets the picture we show, as at a shoulder switch. BB_U3_OTHERAIM=0: off */
+    {
+        static int oa=-1; if (oa<0) { const char *e=getenv("BB_U3_OTHERAIM"); oa=!(e && e[0]=='0'); }
+        uint64_t ovt=0;
+        if (oa && r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_h0_ok && u3_layer_us && now_us()>u3_layer_us && now_us()-u3_layer_us<200000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000) && safe_read(&ovt,r14,8) && ovt==runtime_image_base()+0x16736f0) aim_other=1;
+    }
+    if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && u3_aim_h0_ok && (aim_other || (now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
+        const int swap_only=aim_other || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000));
         if (swap_only && !(u3_layer_us && now_us()-u3_layer_us<200000)) return;
         if (!swap_only) u3_roll_us=now_us();
         if (!swap_only && u3_aim_frame_us && now_us()-u3_aim_frame_us>=25000) {   /* the aiming camera is gone while the aim is still held (measured with the grenade launcher: the game drops its camera after the shot, only walking layers are left, and the mouse was read only in the aiming camera's own layer: the picture stood still until the release). The mouse is taken here, once a frame, with the aim's sensitivity, and the absolute heading the layers are put on follows it */
