@@ -4560,6 +4560,9 @@ static void u3_anim_pivot(const float *p, float *pivot) {   /* round the player 
 }
 #define U3_SCRIPT_YAW_MAX 45.0f    /* degrees each side of the scripted camera's own heading */
 #define U3_SCRIPT_PITCH_MAX 30.0f
+static volatile uint64_t u3_hang_fade_us;   /* last frame the hanging-aim layer kept the mouse after the right button was released: the walking camera must not take the mouse meanwhile (the picture is the layer's) */
+static float u3_hang_carry_yaw, u3_hang_carry_pitch;   /* the mouse's turn the layer took during its fade, owed to the walking camera under it (the picture blends the two: both must turn by the whole of it) */
+static int u3_hang_in_fade;
 static int u3_script_wide;   /* set by the caller of u3_script_layer for the hanging aim camera: wide limits */
 static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim: the ledge / climb camera (image+0x1671390), which the walking camera's update must not feed meanwhile */
     static int disabled=-1;
@@ -4607,6 +4610,7 @@ static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim:
         float step, step_pitch;
         if (u2_mouse_turn(&turn,0,r14,u2_frame_dt(image),1.0f,0.0f,&step,&step_pitch)) {
             total_yaw+=step;
+            if (u3_script_wide && u3_hang_in_fade) { u3_hang_carry_yaw+=step; u3_hang_carry_pitch+=step_pitch; }
             if (mouse_debug() && u3_script_wide && (step!=0.0f || step_pitch!=0.0f)) { float ry=0.0f; double ra=0.0; const int have=bbgpu_camera_yaw(&ry,&ra); const float f3[3]={0.0f,0.0f,1.0f}, s3[3]={1.0f,0.0f,0.0f}; float fv[3], sv[3]; quat_rotate(p+4,f3,fv); quat_rotate(p+4,s3,sv); printf("Mouse: HANG step yaw=%.3f pitch=%.3f total=%.2f/%.2f rend=%.2f%s age=%.3f e0=%.2f side_y=%.3f T=%.4f\n",(double)step,(double)step_pitch,(double)total_yaw,(double)(total_pitch+step_pitch),(double)ry,have ? "" : "?",ra,(double)(SDL_asinf(fv[1]>1.0f ? 1.0f : fv[1]<-1.0f ? -1.0f : fv[1])*57.29578f),(double)sv[1],now*1e-6); }
             if (wm && step!=0.0f) { if (u3_anim_given==u3_anim_given_applied) u3_anim_unapplied_since_us=now; u3_anim_given+=step; }
             if (anim) u3_anim_arc_delta+=step_pitch/115.0f;   /* (this class gets its pitch from the game: the walking camera's arc, whose stops, distances and pivot are the pad's; measured 2026-11-01: ~115 degrees of view elevation per unit; turning the pose here put the camera into the floor and into the player) */
@@ -4860,7 +4864,18 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
             /* (measured 2026-11-11, chapter 12, hanging: the right button without a weapon fades in a layer of class +0x1670400 over the walking camera, which stops being updated: the mouse
              * had nowhere to go. It is turned like the scripted camera, in place. BB_U3_HANGLOOK=0: off) */
             static int hang_on=-1; if (hang_on<0) { const char *e=getenv("BB_U3_HANGLOOK"); hang_on=!(e && e[0]=='0'); }
-            if (hang_on && aim_held && vt==runtime_image_base()+0x1670400) { u3_script_wide=1; u3_script_layer(r14,image,0); u3_script_wide=0; return; }
+            /* (measured 2026-11-11: after the right button is released the layer fades out for 0.04..1.1 s before the walking camera is updated again, and the mouse was dead
+             * meanwhile; the layer keeps the mouse until it is gone. BB_U3_HANGFADE=0: off) */
+            static uint64_t hang_us; static int fade_on=-1; if (fade_on<0) { const char *e=getenv("BB_U3_HANGFADE"); fade_on=!(e && e[0]=='0'); }
+            const uint64_t hn=now_us();
+            const int hang_fade=fade_on && !aim_held && hang_us && hn>=hang_us && hn-hang_us<1500000;
+            if (hang_on && (aim_held || hang_fade) && vt==runtime_image_base()+0x1670400) {
+                if (aim_held) { hang_us=hn; u3_hang_carry_yaw=u3_hang_carry_pitch=0.0f; }
+                else u3_hang_fade_us=hn;
+                u3_hang_in_fade=!aim_held;
+                if (!aim_held && mouse_debug()) { static uint64_t tr_us; if (hn-tr_us>100000) { tr_us=hn; printf("Mouse: HANG fade: the layer keeps the mouse %.0f ms after the release t=%.4f\n",(double)((hn-hang_us)*1e-3),hn*1e-6); } }
+                u3_script_wide=1; u3_script_layer(r14,image,0); u3_script_wide=0; return;
+            }
             if (vt==runtime_image_base()+0x16705f0 && u3_anim_layer_us && now_us()-u3_anim_layer_us<50000) u3_anim_walk_layer(r14);   /* (no return: the layer is the walking camera's) */
         }
     }
@@ -5681,7 +5696,17 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     const float dir_h0=heading_of((const float *)(uintptr_t)(camera+0x78c0));
     const float arc0=*(const float *)(uintptr_t)(camera+0x7874);
     follow_arc_max=0.76f;
-    follow_camera(camera,0x78c0,0x7874,105.0f,0,0);
+    /* (measured 2026-11-11: the walking camera resumes under the fading hanging-aim layer and took the mouse from it, while the picture was still the layer's: the mouse was dead
+     * until the layer was gone. The layer keeps the mouse while it is dispatched, 100 ms of grace) */
+    if (u3_hang_fade_us && now>=u3_hang_fade_us && now-u3_hang_fade_us<100000 && !aim_held) {
+        follow_applied=0.0f; follow_arc_moved=0;
+        const float cy=u3_hang_carry_yaw, cp=u3_hang_carry_pitch;   /* (the walking camera under the fading layer takes the same turn, or the blend loses it) */
+        u3_hang_carry_yaw=u3_hang_carry_pitch=0.0f;
+        float *cd=(float *)(uintptr_t)(camera+0x78c0), *carc=(float *)(uintptr_t)(camera+0x7874);
+        if (cy!=0.0f && cy>-180.0f && cy<180.0f) { const float a=cy*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a), x=cd[0], z=cd[2]; cd[0]=x*c-z*s; cd[2]=x*s+z*c; }
+        if (cp!=0.0f && cp>-90.0f && cp<90.0f) { const float v=*carc+cp/105.0f; if (v==v) *carc=v<0.0f ? 0.0f : v>0.76f ? 0.76f : v; }
+    }
+    else follow_camera(camera,0x78c0,0x7874,105.0f,0,0);
     follow_arc_max=1.0f;
     if (mouse_debug()) { static uint64_t arc_us; if (now-arc_us>20000) { arc_us=now; { const float *vp=(const float *)(uintptr_t)(camera+0x7680), *vv=(const float *)(uintptr_t)(camera+0x78a0), *vt=(const float *)(uintptr_t)(camera+0x7650);
       printf("Mouse: U3 ARC t=%.4f before=%.4f after=%.4f mouse=%d pos_dy=%.3f tgt_dy=%.3f h=%.3f piv_y=%.3f\n",now*1e-6,(double)arc0,(double)*(const float *)(uintptr_t)(camera+0x7874),follow_arc_moved,(double)(vp[1]-vv[1]),(double)(vt[1]-vv[1]),(double)SDL_sqrtf((vp[0]-vv[0])*(vp[0]-vv[0])+(vp[2]-vv[2])*(vp[2]-vv[2])),(double)vv[1]);
