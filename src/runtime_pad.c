@@ -4076,8 +4076,12 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
             if (pp[0]>-100000.0f && pp[0]<100000.0f && pp[2]>-100000.0f && pp[2]<100000.0f && gx*gx+gz*gz<9.0f) {
                 if (mouse_debug()) { static uint64_t tpu; if (now-tpu>300000) { tpu=now; printf("Mouse: U3 TRUEPIVOT T=%.4f player=%.3f,%.3f nominal=%.3f,%.3f gap=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[2],(double)pivot[0],(double)pivot[2],(double)gx,(double)gz); } }
                 pivot[0]=pp[0]; pivot[2]=pp[2];
-            }
-        }
+            } else if (!(getenv("BB_U3_TPWORLD") && getenv("BB_U3_TPWORLD")[0]=='0') && safe_read(pp,A+0x1a0,12) && pp[0]>-100000.0f && pp[0]<100000.0f && pp[2]>-100000.0f && pp[2]<100000.0f && (pp[0]-pivot[0])*(pp[0]-pivot[0])+(pp[2]-pivot[2])*(pp[2]-pivot[2])<9.0f) {
+                /* (on a moving platform, the barge of chapter 12, A+0x4d0 is in the platform's own frame, measured 2026-11-11: 1.56,0.50,-0.30 against a world position of 79,-35; A+0x1a0 stays in the world, one frame late. BB_U3_TPWORLD=0: off.) */
+                if (mouse_debug()) { static uint64_t tpw; if (now-tpw>300000) { tpw=now; printf("Mouse: U3 TRUEPIVOT WORLD T=%.4f player=%.3f,%.3f nominal=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[2],(double)pivot[0],(double)pivot[2]); } }
+                pivot[0]=pp[0]; pivot[2]=pp[2];
+            } else if (mouse_debug()) { static uint64_t tpr; if (now-tpr>300000) { tpr=now; printf("Mouse: U3 TRUEPIVOT REJECT T=%.4f A+4d0=%.3f,%.3f,%.3f A+1a0=?, nominal=%.3f,%.3f gap=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[1],(double)pp[2],(double)pivot[0],(double)pivot[2],(double)gx,(double)gz); } }
+        } else if (mouse_debug() && tp && !turret_now) { static uint64_t tpf; if (now-tpf>300000) { tpf=now; printf("Mouse: U3 TRUEPIVOT NOREAD T=%.4f cam=%llx hp=%llx gen=%u A=%llx ag=%u\n",now*1e-6,(unsigned long long)u3_probe_aim_cam,(unsigned long long)hp,(unsigned)gen,(unsigned long long)A,(unsigned)ag); } }
     }
     if (!blending_out) { for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i]; u3_aim_pivot_us=now; }
     if (mouse_debug() && turret_now && r14) {   /* (diagnostic, turret) the player object reached from the turret camera: does [r14+0xb0] give it, and is its orientation (A+0xe0) the turret's heading? */
