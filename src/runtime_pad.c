@@ -3658,7 +3658,10 @@ static float u3_cover_show_h, u3_cover_show_e; static uint64_t u3_cover_show_us;
 static float u3_cover_yaw, u3_cover_pitch;   /* degrees turned by the mouse since the cover began (see u3_cover_layer) */
 static float u3_cover_rend_off; static uint64_t u3_cover_rend_us, u3_cover_lastfix_us;   /* written - rendered heading of the cover picture, measured while the cover runs */
 static float u3_tk_h, u3_tk_e, u3_tk_k; static uint64_t u3_tk_key, u3_tk_start_us;   /* the cover has been left (key: its last frame): the heading / elevation the picture goes on from, turned by the mouse, while the walking camera's own pose settles (u3_cover_exit_layer) */
-static volatile uint64_t u3_probe_aim_cam;   /* the aiming camera object, compared (never written) at the end of the layer blend */
+static float u3_chase_pos_yaw, u3_chase_scale=1.0f;static float u3_chase_ref, u3_chase_last_yaw;static int u3_chase_ok; static volatile int u3_chase_axis=128; static volatile uint64_t u3_chase_us;   /* (BB_U3_CHASE) see u3_aim_out */
+static volatile uint64_t u3_sticktest_us;  /* (measure) when the aim last ran with the test on */
+static volatile int u3_sticktest_rx=128;  /* (measure, BB_U3_STICKTEST) the right stick x the test is sending */
+static volatile uint64_t u3_probe_aim_cam;  /* the aiming camera object, compared (never written) at the end of the layer blend */
 static float u3_dbg_dx, u3_dbg_dy;   /* the raw mouse pixels taken by the last update of the aiming camera (BB_MOUSE_DEBUG trace) */
 static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
@@ -3846,6 +3849,19 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
                 }
                 { long end=ftell(pf); fseek(pf,pos,SEEK_SET); fwrite(&np,4,1,pf); fseek(pf,end,SEEK_SET); }
                 fflush(pf);
+            }
+        }
+    }
+    {   /* (measure, BB_U3_STICKTEST=1) works with a controller too: the game's own heading of the aiming camera, every frame */
+        static int stt=-1; if (stt<0) { const char *e=getenv("BB_U3_STICKTEST"); stt=(e && e[0] && e[0]!='0'); }
+        if (stt && aim_held) {
+            const RuntimeGuestRegs *tg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            const float *to=(const float *)(uintptr_t)tg->rbx;
+            float tv[8];
+            if ((uintptr_t)to>=0x10000 && safe_read(tv,(uint64_t)(uintptr_t)to,sizeof tv)) {
+                float tf[3]; quat_rotate(tv+4,(const float[3]){0.0f,0.0f,1.0f},tf);
+                u3_sticktest_us=now;
+                printf("Mouse: U3 STICKTEST T=%.5f cam=%llx stick=%d heading=%.3f elev=%.3f pos=%.3f,%.3f,%.3f\n",now*1e-6,(unsigned long long)r14,u3_sticktest_rx,(double)(SDL_atan2f(tf[0],tf[2])*57.29578f),(double)(SDL_asinf(tf[1]>1.0f ? 1.0f : tf[1]<-1.0f ? -1.0f : tf[1])*57.29578f),(double)tv[0],(double)tv[1],(double)tv[2]);
             }
         }
     }
@@ -4093,6 +4109,68 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         if (u3_aim_e0-*total_pitch<-80.0f) *total_pitch=u3_aim_e0+80.0f;
         pitch_use=elevation-(u3_aim_e0-*total_pitch);
     }
+    {   /* CHASE (BB_U3_CHASE=1, mouse only): the game's own aim heading follows the heading we show, through the emulated right stick, so that the game redoes its
+         * wall collision (camera pulled in) at our heading. The shown heading stays absolute: ref - total, ref = the game's heading at the start of the aim plus the
+         * mouse's turn then; what we turn the game's pose by is therefore base - (ref - total), whatever the stick made the game's heading do. Measured
+         * 2026-11-11 (BB_U3_STICKTEST): right stick 0.5 = 32 deg/s, starts and stops within 0.1 s. */
+        static int ch=-1; if (ch<0) { const char *e=getenv("BB_U3_CHASE"); ch=!(e && e[0]=='0'); }   /* BB_U3_CHASE=0: off (the old behaviour: the game's heading stays put, the camera against a wall keeps the distance of the untouched heading) */
+        const int allowed=ch && !blending_out && !u3_aim_from_cover && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000) &&
+                          !(u3_swap_press_us && now-u3_swap_press_us<1500000) && !(u3_roll_press_us && now-u3_roll_press_us<2000000);
+        if (allowed) {
+            if (was_out || !u3_chase_ok) { u3_chase_ref=base_heading+*total_yaw; u3_chase_ok=1; }
+            yaw_use=wrap_degrees(base_heading-(u3_chase_ref-*total_yaw));
+            u3_chase_last_yaw=yaw_use;
+            static float pos_f=-1.0f; if (pos_f<0.0f) { const char *e=getenv("BB_U3_CHASEPOS"); pos_f=e && e[0] ? (float)atof(e) : 1.0f; }   /* 1 = the camera's position turned by the whole gap (0 left Drake off-centre: tested 2026-11-11) */
+            u3_chase_pos_yaw=pos_f*yaw_use;
+            {   /* The game's camera distance (collision) is only known at the headings its own camera has passed: kept per 5 degrees of heading (the table is forgotten when the
+                 * player moves 0.3 m, entries older than 3 s are ignored). Our camera sits at the game's distance turned to our heading; where the game has measured a shorter
+                 * distance between its heading and ours (a wall the camera would cross), the distance is cut to the shortest. BB_U3_CHASECLAMP=0: off. */
+                static int cc=-1; if (cc<0) { const char *e=getenv("BB_U3_CHASECLAMP"); cc=!(e && e[0]=='0'); }
+                static float tr[72]; static uint64_t tt[72]; static float tp[3]; static int tok;
+                const float ddx=o[0]-pivot[0], ddy=o[1]-pivot[1], ddz=o[2]-pivot[2], r=SDL_sqrtf(ddx*ddx+ddy*ddy+ddz*ddz);
+                u3_chase_scale=1.0f;
+                if (cc && r>0.05f) {
+                    if (!tok || (pivot[0]-tp[0])*(pivot[0]-tp[0])+(pivot[2]-tp[2])*(pivot[2]-tp[2])>0.09f) { memset(tt,0,sizeof tt); for (int i=0;i<3;++i) tp[i]=pivot[i]; tok=1; }
+                    int b=(int)SDL_floorf((wrap_degrees(base_heading)+180.0f)/5.0f); b=((b%72)+72)%72;
+                    tr[b]=r; tt[b]=now;
+                    const float gap=wrap_degrees(wrap_degrees(u3_chase_ref-*total_yaw)-base_heading)*(pos_f>1.0f ? 1.0f : pos_f);
+                    int n=(int)(SDL_fabsf(gap)/5.0f)+1; if (n>40) n=40;
+                    float rmin=r;
+                    for (int k=0;k<=n;++k) {
+                        const float h=wrap_degrees(base_heading+gap*(float)k/(float)n);
+                        int c=(int)SDL_floorf((h+180.0f)/5.0f); c=((c%72)+72)%72;
+                        for (int dd=-1;dd<=1;++dd) { const int j=((c+dd)%72+72)%72; if (tt[j] && now-tt[j]<3000000 && tr[j]<rmin) rmin=tr[j]; }
+                    }
+                    u3_chase_scale=rmin/r;
+                    if (u3_chase_scale<0.2f) u3_chase_scale=0.2f;
+                }
+                {   /* the cut follows a wall at once (30 ms) and lets go slowly (200 ms): a bin entering and leaving the arc made the distance flicker (0.82-1.0 within a few frames, measured) */
+                    static float sm=1.0f; static uint64_t sm_us;
+                    if (was_out || !sm_us || now-sm_us>200000) sm=1.0f;
+                    const float dts=sm_us && now>sm_us ? (float)(now-sm_us)*1e-6f : 0.0f; sm_us=now;
+                    sm+=(u3_chase_scale-sm)*(1.0f-SDL_expf(-dts/(u3_chase_scale<sm ? 0.03f : 0.2f)));
+                    u3_chase_scale=sm;
+                }
+            }
+            const float tau=0.15f, full=85.0f;   /* seconds to close the gap; deg/s of a full stick (0.5 gives 32: dead zone (m-0.2)*1.25) */
+            static uint64_t ff_us; static float ff_total, ff_rate;   /* the mouse's own turning rate (feed-forward: the gap stays small while it turns, the stick does not hunt) */
+            if (ff_us && now>ff_us+2000 && now-ff_us<100000) { const float dt=(float)(now-ff_us)*1e-6f, r=(*total_yaw-ff_total)/dt; ff_rate+=(1.0f-SDL_expf(-dt/0.05f))*(r-ff_rate); }
+            else if (!ff_us || now-ff_us>=100000) ff_rate=0.0f;
+            if (!ff_us || now>ff_us+2000) { ff_us=now; ff_total=*total_yaw; }
+            static int ffon=-1; if (ffon<0) { const char *e=getenv("BB_U3_CHASEFF"); ffon=!(e && e[0]=='0'); }
+            float u=(yaw_use/tau+(ffon ? ff_rate : 0.0f))/full;
+            if (u>1.0f) u=1.0f; if (u<-1.0f) u=-1.0f;
+            float m=0.0f;
+            if (u>0.03f || u<-0.03f) m=0.2f+(u<0.0f ? -u : u)/1.25f;
+            u3_chase_axis=(int)(128.0f+(u<0.0f ? -m : m)*127.0f+0.5f);
+            u3_chase_us=now;
+            if (mouse_debug()) { static uint64_t cp; if (now-cp>100000) { cp=now; const float rx=o[0]-pivot[0], rz=o[2]-pivot[2];
+                printf("Mouse: U3 CHASE T=%.4f raw=%.2f target=%.2f gap=%.2f axis=%d radius=%.3f total=%.2f scale=%.2f\n",now*1e-6,(double)base_heading,(double)wrap_degrees(u3_chase_ref-*total_yaw),(double)yaw_use,u3_chase_axis,(double)SDL_sqrtf(rx*rx+rz*rz),(double)*total_yaw,(double)u3_chase_scale); } }
+        } else if (u3_chase_ok) {
+            u3_chase_ok=0;
+            if (!blending_out) { *total_yaw=u3_chase_last_yaw; yaw_use=*total_yaw; }   /* (continues from the heading shown) */
+        }
+    }
     if (blending_out) yaw_use=wrap_degrees(base_heading-u3_aim_last_heading);   /* the picture keeps the heading it had at the release, whatever the base has followed */
     if (blending_out) pitch_use=elevation-u3_aim_last_elev;   /* (the same for the height: the elevation it had at the release) */
     const float ya=-yaw_use*0.017453293f*0.5f, pa=pitch_use*0.017453293f*0.5f;
@@ -4107,7 +4185,15 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         const float conj_o[4]={-o[4],-o[5],-o[6],o[7]}, d[3]={o[0]-pivot[0],o[1]-pivot[1],o[2]-pivot[2]};
         float s_eff[3];
         quat_rotate(conj_o,d,s_eff);
-        quat_rotate(q,hold_fresh ? shoulder : s_eff,off);
+        if (u3_chase_ok && !blending_out && u3_chase_scale<1.0f) for (int i=0;i<3;++i) s_eff[i]*=u3_chase_scale;   /* (BB_U3_CHASE: a shorter distance known on the way to our heading) */
+        float qp[4]; const float *qrot=q;
+        if (u3_chase_ok && !blending_out && !hold_fresh) {   /* CHASE: the camera sits where the game put it, turned toward our heading by only a fraction of the gap (BB_U3_CHASEPOS, default 0): a position the game has checked against the walls */
+            const float yp=-u3_chase_pos_yaw*0.017453293f*0.5f, qy2[4]={0.0f,SDL_sinf(yp),0.0f,SDL_cosf(yp)};
+            float t2[4]; quat_mul(qy2,o+4,t2); quat_mul(t2,qpitch,qp);
+            const float n2=SDL_sqrtf(qp[0]*qp[0]+qp[1]*qp[1]+qp[2]*qp[2]+qp[3]*qp[3]);
+            if (n2>0.5f) { for (int i=0;i<4;++i) qp[i]/=n2; qrot=qp; }
+        }
+        quat_rotate(hold_fresh ? q : qrot,hold_fresh ? shoulder : s_eff,off);
     }
     {
         float ff[3];
@@ -8423,6 +8509,15 @@ static void sample_host(PadData *d) {
         }
     } else {
         mouse_vx=mouse_vy=0; mouse_last_us=0;
+    }
+    if (aim_held && u3_chase_us && now>u3_chase_us && now-u3_chase_us<100000) d->right_x=(uint8_t)u3_chase_axis;   /* (BB_U3_CHASE) the game's heading follows the one we show */
+    {   /* (measure, BB_U3_STICKTEST=1) square wave on the right stick while the U3 aim is held: +0.5 / 0 / -0.5 / 0, one second each; u3_aim_out logs the game's own heading (U3 STICKTEST) */
+        static int st=-1; if (st<0) { const char *e=getenv("BB_U3_STICKTEST"); st=(e && e[0] && e[0]!='0'); }
+        u3_sticktest_rx=128;
+        if (st && aim_held && u3_sticktest_us && now>u3_sticktest_us && now-u3_sticktest_us<200000) {
+            const int ph=(int)((now/1000000)%4), off=ph==0 ? 64 : ph==2 ? -64 : 0;
+            d->right_x=(uint8_t)(128+off); u3_sticktest_rx=128+off;
+        }
     }
 }
 
