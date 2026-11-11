@@ -335,6 +335,9 @@ static volatile int l2_held;             /* L2 itself, without the cases where t
 static volatile uint64_t u3_turret_us;    /* U3: last frame the turret's aiming-class layer was shown alone on top */
 static volatile uint64_t look_blend_until_us; /* the look-around camera (V) is blended out for about a second after the key is released: it keeps the mouse until then */
 static volatile int look_held;            /* R3 is held: first-person look around, which turns like the aim */
+static int safe_read(void *dst, uint64_t src, size_t size);
+static int safe_write(uint64_t dst, const void *src, size_t size);
+static uint64_t rope_blind_us; static int rope_run;   /* U3 rope detector state (follow_camera): last call that showed the signature; consecutive hits */
 static float follow_target;               /* wanted heading (degrees) */
 static uint64_t follow_moved_us;          /* last frame the mouse moved */
 static uint64_t follow_tilt_us;           /* last frame the mouse moved vertically (follow_moved_us is the turn) */
@@ -392,6 +395,7 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
         float ignore_x, ignore_y;
         camera_take(0,&ignore_x,&ignore_y);
         follow_moved_us=0; follow_pending=0; follow_push=0.0f; follow_correction=0.0f; follow_target=heading; follow_prev_total=0.0f;
+        rope_blind_us=0; rope_run=0;
         if (mouse_debug()) printf("Mouse: follow resync after a %.0f ms gap (heading %.2f) t=%.4f\n",gap_us*1e-3,(double)heading,now*1e-6);
     }
     follow_call_us=now;
@@ -410,12 +414,36 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
         follow_direct=1; follow_kept=0.5f;   /* the turns of the direct mode with the push are the ones the game keeps (in the joypad mode it pulled the direction back at once) */
         dx=0.0f; dy=0.0f;
     }
-    if (aim_native || look_held) { follow_moved_us=0; follow_pending=0; follow_push=0.0f; follow_prev_total=0.0f; return; } /* the aiming / look camera takes the mouse */
+    if (aim_native || look_held) { rope_blind_us=0; rope_run=0; follow_moved_us=0; follow_pending=0; follow_push=0.0f; follow_prev_total=0.0f; return; } /* the aiming / look camera takes the mouse */
     if (stopped) { /* paused (or a frame time out of range): the mouse is taken but not applied, the camera goes on as the game wants */
         follow_moved_us=0; follow_pending=0; follow_push=0.0f; follow_correction=0.0f; follow_prev_total=0.0f;
         if (mouse_debug()) { static unsigned n; if ((n++&31)==0) printf("Mouse: u2 follow camera %#llx stopped (dt out of range) t=%.4f\n",(unsigned long long)camera,now*1e-6); }
         return;
     }
+    /* U3 rope (measured 2026-11-11, last_run_corde.log): swinging on a rope the game puts the direction field back every frame (heading steady at -25 while we write 10 degrees
+     * a frame), yet the picture DOES follow our writes (shown moved 45 degrees in 8 frames). The kept test, which reads the field, then said "turns not kept" and the mouse went
+     * back and forth between direct and the emulated stick every ~0.1 s (the stick does not turn a rope camera: the picture was pulled back, then jumped at the next direct frame),
+     * and the make-up of the "shortfall" added 4 degrees a frame that no mouse had asked for. Detected as: the picture moves by more than 2.5 degrees while the field moves under 0.6
+     * (3 calls running). While it holds (0.4 s after the last such call) the route stays direct, the kept test is not read and nothing is made up (1:1). BB_U3_ROPE=0: off. */
+    static int rope_off=-1; if (rope_off<0) { const char *e=getenv("BB_U3_ROPE"); rope_off=e && e[0]=='0'; }
+    static float rope_prev_h, rope_prev_s; static uint64_t rope_prev_us;
+    if (!rope_off && arc_degrees==105.0f) {
+        float rs=0.0f; double ra=0.0;
+        const int have=bbgpu_camera_yaw(&rs,&ra) && ra<0.25;
+        if (have) {
+            if (rope_prev_us && now>rope_prev_us && now-rope_prev_us<100000) {
+                const float dh=SDL_fabsf(wrap_degrees(heading-rope_prev_h)), ds=SDL_fabsf(wrap_degrees(rs-rope_prev_s));
+                if (dh<0.6f && ds>2.5f) { if (rope_run<10) ++rope_run; if (rope_run>=3) rope_blind_us=now; }
+                else if (dh>=1.5f) rope_run=0;
+            } else rope_run=0;
+            rope_prev_h=heading; rope_prev_s=rs; rope_prev_us=now;
+        }
+    }
+    const int rope_blind=rope_blind_us && now>=rope_blind_us && now-rope_blind_us<5000000;   /* (the mouse moving keeps it on, 5 s after the last move it lets go; the gap / aim / look / cover paths clear it; measured 2026-11-11 with a real stick on the rope: the game turns the camera at 250 degrees/s and keeps it, direction writes are undone each frame from a state not found yet, so the mouse goes through the emulated stick (full stick = 240 degrees/s, mouse_axis); every 1.5 s direct is tried again for the 3 calls the detector needs) */
+    if (mouse_debug()) { static int was; if (rope_blind!=was) { was=rope_blind; printf("Mouse: U3 ROPE blind=%d (direction field not followed, picture is) t=%.4f\n",rope_blind,now*1e-6); } }
+    if (rope_blind && dx!=0.0f) rope_blind_us=now;
+    static int rope_snap=-1; if (rope_snap<0) { const char *e=getenv("BB_U3_ROPESNAP"); rope_snap=!(e && e[0]=='0'); }   /* BB_U3_ROPESNAP=0: the rope goes through the emulated stick instead (240 degrees/s at most, a joystick feel); default: direct writes + the camera position at +0x290 turned about the pivot (validated in play 2026-11-11) */
+    if (rope_blind) { follow_pending=0; follow_kept=0.5f; follow_direct=rope_snap; }
     if (follow_pending && u3_aim_fade_window(now)) {   /* U3: the game pulls the walking camera back while the aim fades out (measured after the grenade launcher: kept 0 % for ~1 s, the mouse fell to the emulated stick and hardly moved): that says nothing about the direct mode */
         follow_pending=0; follow_kept=0.5f; follow_direct=1;
     }
@@ -442,7 +470,7 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
     const uint64_t still=now-follow_moved_us;
     const int resting=!follow_moved_us || (still>150000 && (SDL_fabsf(correction)<0.5f || still>500000));
     if (turn!=0.0f) follow_moved_us=now;
-    if (resting) {
+    if (resting || rope_blind) {
         follow_target=heading;
         correction=0.0f;
     }
@@ -467,7 +495,7 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
          * whether direct turns are kept again */
         follow_correction=correction;
         follow_push=0.0f;
-        if (turn!=0.0f) {
+        if (turn!=0.0f && !rope_blind) {
             const float probe=turn>0.0f ? 0.3f : -0.3f;
             const float a=probe*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a);
             const float x=dir[0], z=dir[2];
@@ -501,6 +529,19 @@ static void follow_camera(uint64_t camera, uint32_t dir_offset, uint32_t arc_off
         const float x=dir[0], z=dir[2];
         dir[0]=x*c-z*s;
         dir[2]=x*s+z*c;
+        if (rope_blind && rope_snap) {   /* (measured 2026-11-11, rope: at each update the game rebuilds the direction from a copy of the last one (camera+0x1b0 x, +0x1b8 z; at every entry it equals the direction of the previous entry, before our write), so a write to +0x78c0 alone is undone; the copy is turned by the same angle) */
+            /* (measured 2026-11-11 by disassembly of the update 0x4e8e40 and its virtual +0x2b8 = 0x4ed4f0: the update recomputes the direction as the horizontal direction
+             * from the pivot T = camera+0x240 to a point X worked out (0x4e5a40) from camera+0x290, the camera position of the last frame, which lies at T + 3.9 m along the
+             * direction. Writing the direction alone is undone; the position at +0x290 is turned about T by the same angle) */
+            float tp[3], cp[3];
+            if (safe_read(tp,camera+0x240,12) && safe_read(cp,camera+0x290,12) && tp[0]==tp[0] && cp[0]==cp[0]) {
+                const float rx=cp[0]-tp[0], rz=cp[2]-tp[2], l2=rx*rx+rz*rz;
+                if (l2>0.25f && l2<400.0f) {
+                    cp[0]=tp[0]+rx*c-rz*s; cp[2]=tp[2]+rx*s+rz*c;
+                    safe_write(camera+0x290,cp,12);
+                }
+            }
+        }
         if (SDL_fabsf(total)>=0.15f) {
             follow_before=heading;
             follow_after=heading_of(dir);
