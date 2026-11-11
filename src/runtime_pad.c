@@ -5129,7 +5129,8 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
             u3_wt_slot[sl].seen_us=now;
             float deg=(float)(u3_anim_given-u3_wt_slot[sl].applied);
             const float owed=u3_wt_carry_owed(now);
-            if ((deg>60.0f || deg<-60.0f) && !(owed!=0.0f && SDL_fabsf(deg)<=SDL_fabsf(owed)+60.0f)) {   /* (the handover's carry is owed on purpose) a camera that slept and wakes was owed the whole turn made meanwhile: the picture jumped by it at a door (measured 2026-11-04: 243 degrees in one update). A real fast flick is far under 60 degrees per update */
+            static float wt_drop=-1.0f; if (wt_drop<0.0f) { const char *e=getenv("BB_U3_WTDROP"); wt_drop=e ? (float)atof(e) : 400.0f; }   /* (degrees owed above which a camera is taken for a sleeper woken up; 400 since 2026-11-11, validated in play; BB_U3_WTDROP=60 = old; a fast flick of the mouse makes 100 to 300 per update, measured 2026-11-11: the turn was dropped each update and the picture stopped dead) */
+            if ((deg>wt_drop || deg<-wt_drop) && !(owed!=0.0f && SDL_fabsf(deg)<=SDL_fabsf(owed)+wt_drop)) {   /* (the handover's carry is owed on purpose) a camera that slept and wakes was owed the whole turn made meanwhile: the picture jumped by it at a door (measured 2026-11-04: 243 degrees in one update). A real fast flick is far under 60 degrees per update */
                 if (mouse_debug()) printf("Mouse: U3 WT cam=%llx catch-up of %.1f degrees dropped t=%.4f\n",(unsigned long long)camera,(double)deg,now*1e-6);
                 u3_wt_slot[sl].applied=u3_anim_given; deg=0.0f;
             }
