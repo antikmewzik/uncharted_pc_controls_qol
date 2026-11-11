@@ -4240,6 +4240,34 @@ static void u3_cover_exit_layer(uint64_t r14) {
     if (mouse_debug()) printf("Mouse: U3 cover exit blend T=%.4f w=%.2f walk=%.2f ours=%.2f -> %.2f elev walk=%.2f ours=%.2f pos=%.3f,%.3f,%.3f\n",now*1e-6,(double)w,(double)hp,(double)u3_tk_h,(double)th,(double)ef,(double)u3_tk_e,(double)p[0],(double)p[1],(double)p[2]);
     u3_turn_pose(p,pivot,wrap_degrees(hp-th),ef-te);
 }
+/* (measured 2026-11-11, 15 exits, last_run_u3_finalpose_saut.log: at the takeover the walking-class layer on top (cam ...b500) shows the walking camera's raw heading for 1 to 2 frames,
+ * 11 degrees off the picture (exits 4, 8: one frame; exit 9: two frames then a 20 degree swing; exit 1: a lasting 11.7 degree step). Wiktor's "small jump ~1 s after the exit".
+ * Each layer shown at full weight is put on the picture rendered at the takeover (plus the mouse's turn since) for 150 ms, then released over 250 ms. BB_U3_RELAISHOLD=0: off) */
+static void u3_relais_hold(uint64_t r14) {
+    static int on=-1; if (on<0) { const char *e=getenv("BB_U3_RELAISHOLD"); on=!(e && e[0]=='0'); }
+    static uint64_t key, start_us, tkkey; static float ry0, tk0; static int ok;
+    const uint64_t now=now_us();
+    /* (second run, same day: the first bad frame comes BEFORE the takeover is noticed, the cover camera having missed one update (age >= 30 ms): the hold starts there, keyed on the cover's last update) */
+    if (!on || !u3_cover_pivot_ok || !u3_cover_seen_us || now<u3_cover_seen_us+30000 || now-u3_cover_seen_us>=400000) return;
+    if (key!=u3_cover_seen_us) {
+        key=u3_cover_seen_us; start_us=now; tkkey=0; float ry=0.0f; double ra=0.0;
+        ok=bbgpu_camera_yaw(&ry,&ra) && ra<0.1 && ry==ry; ry0=ry; tk0=u3_tk_h;
+        if (mouse_debug()) printf("Mouse: U3 relais hold start T=%.4f ok=%d rendered=%.2f age=%.0fms\n",now*1e-6,ok,(double)ry0,(double)((now-u3_cover_seen_us)*1e-3));
+    }
+    if (u3_tk_key==u3_cover_seen_us && tkkey!=u3_tk_key) { tkkey=u3_tk_key; tk0=u3_tk_h; }   /* (the mouse's turn counts from the takeover) */
+    if (!ok) return;
+    float w=0.0f; const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    float *p=(float *)(uintptr_t)g->rax;
+    if ((uintptr_t)p<0x10000 || !safe_read(&w,r14+0x108,4) || w<0.99f) return;
+    const float len2=p[4]*p[4]+p[5]*p[5]+p[6]*p[6]+p[7]*p[7];
+    if (!(len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f)) return;
+    const float fwd[3]={0.0f,0.0f,1.0f}; float f[3]; quat_rotate(p+4,fwd,f);
+    const float hp=SDL_atan2f(f[0],f[2])*57.29578f, target=wrap_degrees(ry0+(tkkey ? wrap_degrees(u3_tk_h-tk0) : 0.0f));
+    const float el=(float)(now-start_us)*1e-6f, s=el<=0.15f ? 0.0f : el>=0.4f ? 1.0f : (el-0.15f)*4.0f, rel=s*s*(3.0f-2.0f*s);
+    const float dh=wrap_degrees(hp-target)*(1.0f-rel);
+    if (mouse_debug()) printf("Mouse: U3 relais hold T=%.4f cam=%llx pose=%.2f target=%.2f turn=%.2f\n",now*1e-6,(unsigned long long)r14,(double)hp,(double)target,(double)dh);
+    u3_turn_pose(p,u3_cover_pivot,dh,0.0f);
+}
 /* In a roll the player moves away from the pivot the aiming camera left, and the camera that followed him (the walking camera's layer) is what the picture
  * is built on: its pose keeps the same place relative to him. The pivot is taken as that place (its offset in the camera's frame, measured on the walking
  * layer at the first frame after the press, while the aiming camera still runs) and found again from each frame's pose, so the camera turns about the player. */
@@ -4584,6 +4612,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
             printf("Mouse: U3 LAYER age=%.0fms cam=%llx%s w=%.3f blend_h=%.2f blend_e=%.2f\n",(double)((now_us()-u3_cover_seen_us)*1e-3),(unsigned long long)r14,r14==u3_cover_cam ? "(cover)" : "",(double)w,(double)(SDL_atan2f(pf[0],pf[2])*57.29578f),(double)(SDL_asinf(pf[1]>1.0f ? 1.0f : pf[1]<-1.0f ? -1.0f : pf[1])*57.29578f));
         }
     }
+    if (r14 && r14!=u3_cover_cam && u3_cover_seen_us && !aim_held && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us)) u3_relais_hold(r14);
     /* (the game reuses addresses: the aiming camera can sit where a cover camera was: it is the cover's layer only while the cover is recent) */
     if (r14 && r14==u3_cover_cam && (r14!=u3_probe_aim_cam || (u3_cover_seen_us && now_us()-u3_cover_seen_us<400000))) {
         if (mouse_debug() && !aim_held && u3_cover_seen_us && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<2000000) {   /* (trace: the cover camera's layer after its update stopped, i.e. during the fade out) */
@@ -4595,9 +4624,9 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
                 printf("Mouse: U3 cover FADE T=%.4f pos=%.3f,%.3f,%.3f age=%.0fms w=%.3f cover_h=%.2f final_h=%.2f final_e=%.2f\n",now_us()*1e-6,(double)p[0],(double)p[1],(double)p[2],(double)((now_us()-u3_cover_seen_us)*1e-3),(double)w,(double)(SDL_atan2f(cf[0],cf[2])*57.29578f),(double)(SDL_atan2f(pf[0],pf[2])*57.29578f),(double)(SDL_asinf(pf[1]>1.0f ? 1.0f : pf[1]<-1.0f ? -1.0f : pf[1])*57.29578f));
             }
         }
-        if (u3_tk_key && u3_tk_key==u3_cover_seen_us && !aim_held && now_us()-u3_cover_seen_us>=60000) { u3_cover_exit_layer(r14); return; }
-        if (!aim_held && u3_tk_key!=u3_cover_seen_us && (u3_exit_test()&2) && !(u3_exit_test()&1) && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us) && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<400000) { u3_cover_hold(r14); return; }
-        u3_cover_layer(r14); return;
+        if (u3_tk_key && u3_tk_key==u3_cover_seen_us && !aim_held && now_us()-u3_cover_seen_us>=60000) { u3_cover_exit_layer(r14); u3_relais_hold(r14); return; }
+        if (!aim_held && u3_tk_key!=u3_cover_seen_us && (u3_exit_test()&2) && !(u3_exit_test()&1) && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us) && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<400000) { u3_cover_hold(r14); u3_relais_hold(r14); return; }
+        u3_cover_layer(r14); if (!aim_held) u3_relais_hold(r14); return;   /* (the cover's layer is the one on top: a hold written under it is overwritten) */
     }
     /* Moving along a cover the game keeps several cover-class cameras (class +0x1670210) in the stack, one more at each step, fading over the previous one.
      * Only the one whose update (0x4ce080) we see is turned; the newer ones, blended over it, showed their raw pose: the picture stood still or lagged
