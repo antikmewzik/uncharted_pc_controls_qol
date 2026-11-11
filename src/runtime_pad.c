@@ -4237,6 +4237,31 @@ static int u3_turn_pose(float *p, const float *pivot, float yaw, float pitch) {
     p[7]=q[3];
     return 1;
 }
+/* The hanging aim camera (measured 2026-11-11): its rest pose carries a roll of ~20 degrees (the pose's side axis has a vertical part of 0.35 to 0.58) and looks 50-70 degrees up, so a pitch about the pose's
+ * own side axis swung the view sideways instead of changing its elevation. Here the pitch is about the HORIZONTAL axis perpendicular to the heading (elevation changes by exactly that), the yaw about the world
+ * up, both about the pivot. A positive pitch looks down. */
+static int u3_turn_pose_world(float *p, const float *pivot, float yaw, float pitch) {
+    const float fz[3]={0.0f,0.0f,1.0f}; float f[3];
+    quat_rotate(p+4,fz,f);
+    (void)f;
+    /* (2026-11-11, second try: with the roll the world axes made the aim follow a diagonal line on the screen. Both turns are now about the CAMERA's own axes: screen vertical = mouse vertical,
+     * screen horizontal = mouse horizontal; the position goes round the pivot with the pose.) */
+    const float pa=pitch*0.017453293f*0.5f, ya=-yaw*0.017453293f*0.5f;
+    const float qp[4]={SDL_sinf(pa),0.0f,0.0f,SDL_cosf(pa)}, qy[4]={0.0f,SDL_sinf(ya),0.0f,SDL_cosf(ya)};
+    float qr[4], q[4];
+    quat_mul(qy,qp,qr);
+    quat_mul(p+4,qr,q);
+    const float nq=SDL_sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    if (!(nq>0.5f)) return 0;
+    for (int i=0;i<4;++i) q[i]/=nq;
+    const float conj[4]={-p[4],-p[5],-p[6],p[7]};
+    const float off[3]={p[0]-pivot[0],p[1]-pivot[1],p[2]-pivot[2]}; float local[3], turned[3];
+    quat_rotate(conj,off,local);
+    quat_rotate(q,local,turned);
+    for (int i=0;i<3;++i) { p[i]=pivot[i]+turned[i]; p[4+i]=q[i]; }
+    p[7]=q[3];
+    return 1;
+}
 /* U3 V view (look-around, R3 / d-pad up). Its camera is a class of its own (vtable image+0x1671c30; its update 0x4f1370 only runs at the start, the
  * pose is then kept by the layer stack), so the mouse turns the final pose at the layer hook, like the cover: the total turn since V began is applied to
  * the pose the game gives each frame (yaw about the world up, pitch about the pose's side), about the pose's own position (the view stays at the head).
@@ -4535,6 +4560,7 @@ static void u3_anim_pivot(const float *p, float *pivot) {   /* round the player 
 }
 #define U3_SCRIPT_YAW_MAX 45.0f    /* degrees each side of the scripted camera's own heading */
 #define U3_SCRIPT_PITCH_MAX 30.0f
+static int u3_script_wide;   /* set by the caller of u3_script_layer for the hanging aim camera: wide limits */
 static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim: the ledge / climb camera (image+0x1671390), which the walking camera's update must not feed meanwhile */
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -4581,14 +4607,23 @@ static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim:
         float step, step_pitch;
         if (u2_mouse_turn(&turn,0,r14,u2_frame_dt(image),1.0f,0.0f,&step,&step_pitch)) {
             total_yaw+=step;
+            if (mouse_debug() && u3_script_wide && (step!=0.0f || step_pitch!=0.0f)) { float ry=0.0f; double ra=0.0; const int have=bbgpu_camera_yaw(&ry,&ra); const float f3[3]={0.0f,0.0f,1.0f}, s3[3]={1.0f,0.0f,0.0f}; float fv[3], sv[3]; quat_rotate(p+4,f3,fv); quat_rotate(p+4,s3,sv); printf("Mouse: HANG step yaw=%.3f pitch=%.3f total=%.2f/%.2f rend=%.2f%s age=%.3f e0=%.2f side_y=%.3f T=%.4f\n",(double)step,(double)step_pitch,(double)total_yaw,(double)(total_pitch+step_pitch),(double)ry,have ? "" : "?",ra,(double)(SDL_asinf(fv[1]>1.0f ? 1.0f : fv[1]<-1.0f ? -1.0f : fv[1])*57.29578f),(double)sv[1],now*1e-6); }
             if (wm && step!=0.0f) { if (u3_anim_given==u3_anim_given_applied) u3_anim_unapplied_since_us=now; u3_anim_given+=step; }
             if (anim) u3_anim_arc_delta+=step_pitch/115.0f;   /* (this class gets its pitch from the game: the walking camera's arc, whose stops, distances and pivot are the pad's; measured 2026-11-01: ~115 degrees of view elevation per unit; turning the pose here put the camera into the floor and into the player) */
             else total_pitch+=step_pitch;
             /* the game's own stick turned this camera over about +-35 degrees (measured: the heading stayed within -20..-68 while following Sully): no full turn */
             if (anim) {   /* the ledge / climb camera orbits the player with the stick, as the walking camera does: no limit on the heading */
             } else {
-                total_yaw=total_yaw<-U3_SCRIPT_YAW_MAX ? -U3_SCRIPT_YAW_MAX : total_yaw>U3_SCRIPT_YAW_MAX ? U3_SCRIPT_YAW_MAX : total_yaw;
-                total_pitch=total_pitch<-U3_SCRIPT_PITCH_MAX ? -U3_SCRIPT_PITCH_MAX : total_pitch>U3_SCRIPT_PITCH_MAX ? U3_SCRIPT_PITCH_MAX : total_pitch;
+                if (u3_script_wide) {   /* (the hanging aim camera, measured with the pad 2026-11-11: it orbits a point 1.5 m ahead of its rest pose, elevation -22..88 degrees, no limit in heading; the rest pose looks ~82 degrees up) */
+                    const float rf[3]={0.0f,0.0f,1.0f}; float rv[3]; quat_rotate(p+4,rf,rv);
+                    const float e0=SDL_asinf(rv[1]>1.0f ? 1.0f : rv[1]<-1.0f ? -1.0f : rv[1])*57.29578f;
+                    (void)e0; const float lo=-170.0f, hi=170.0f;   /* (the elevation limit is checked on the result, in the layer) */
+                    total_pitch=total_pitch<lo ? lo : total_pitch>hi ? hi : total_pitch;
+                } else {
+                const float ymax=U3_SCRIPT_YAW_MAX, pmax=U3_SCRIPT_PITCH_MAX;
+                total_yaw=total_yaw<-ymax ? -ymax : total_yaw>ymax ? ymax : total_yaw;
+                total_pitch=total_pitch<-pmax ? -pmax : total_pitch>pmax ? pmax : total_pitch;
+                }
             }
         }
         frame_us=now;
@@ -4607,6 +4642,25 @@ static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim:
     if (mouse_debug() && !anim) { static unsigned n; if ((n++&15)==0) printf("Mouse: U3 scripted camera turn yaw=%.2f pitch=%.2f w=%.3f\n",(double)total_yaw,(double)total_pitch,(double)w); }
     float pivot[3]={p[0],p[1],p[2]};
     if (anim) u3_anim_pivot(p,pivot);
+    if (!anim && u3_script_wide) {   /* (orbit like the pad: pivot 1.5 m ahead of the rest pose. BB_U3_HANGPIV=0: in place) */
+        static int hp=-1; if (hp<0) { const char *e=getenv("BB_U3_HANGPIV"); hp=!(e && e[0]=='0'); }
+        if (hp) { const float rf[3]={0.0f,0.0f,1.0f}; float rv[3]; quat_rotate(p+4,rf,rv); pivot[0]=p[0]+1.5f*rv[0]; pivot[1]=p[1]+1.5f*rv[1]; pivot[2]=p[2]+1.5f*rv[2]; }
+    }
+    if (!anim && u3_script_wide) {   /* (BB_U3_HANGWORLD=0: pitch about the pose's own side axis) */
+        static int hw=-1; if (hw<0) { const char *e=getenv("BB_U3_HANGWORLD"); hw=!(e && e[0]=='0'); }
+        if (hw) {
+            /* the elevation stays in what the pad reaches (-25..88): a pitch that would leave it is held at the last one that did not */
+            static float last_ok_pitch;
+            float tmp[8]; memcpy(tmp,p,sizeof(tmp));
+            u3_turn_pose_world(tmp,pivot,total_yaw*w,total_pitch*w);
+            const float tz[3]={0.0f,0.0f,1.0f}; float tf[3]; quat_rotate(tmp+4,tz,tf);
+            const float te=SDL_asinf(tf[1]>1.0f ? 1.0f : tf[1]<-1.0f ? -1.0f : tf[1])*57.29578f;
+            if (te>88.0f || te<-25.0f) { total_pitch=last_ok_pitch; memcpy(tmp,p,sizeof(tmp)); u3_turn_pose_world(tmp,pivot,total_yaw*w,total_pitch*w); }
+            else last_ok_pitch=total_pitch;
+            memcpy(p,tmp,sizeof(tmp));
+            return;
+        }
+    }
     if (!anim) { u3_turn_pose(p,pivot,total_yaw*w,total_pitch*w); return; }
     if (wm) {   /* the walking camera carries the turn, this layer reads it; a layer of a walking camera that is no longer updated (the game fades in a new one over ~1 s) is turned here by what that camera lacks */
         int ws=-1;
@@ -4803,6 +4857,10 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         uint64_t vt=0;
         if (safe_read(&vt,r14,8)) {
             if (vt==runtime_image_base()+0x1671390) { u3_script_layer(r14,image,1); return; }
+            /* (measured 2026-11-11, chapter 12, hanging: the right button without a weapon fades in a layer of class +0x1670400 over the walking camera, which stops being updated: the mouse
+             * had nowhere to go. It is turned like the scripted camera, in place. BB_U3_HANGLOOK=0: off) */
+            static int hang_on=-1; if (hang_on<0) { const char *e=getenv("BB_U3_HANGLOOK"); hang_on=!(e && e[0]=='0'); }
+            if (hang_on && aim_held && vt==runtime_image_base()+0x1670400) { u3_script_wide=1; u3_script_layer(r14,image,0); u3_script_wide=0; return; }
             if (vt==runtime_image_base()+0x16705f0 && u3_anim_layer_us && now_us()-u3_anim_layer_us<50000) u3_anim_walk_layer(r14);   /* (no return: the layer is the walking camera's) */
         }
     }
@@ -5444,7 +5502,13 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     float dir[3], arc;
     if (slot[sl].frames<8 || !safe_read(dir,camera+0x78c0,12) || !safe_read(&arc,camera+0x7874,4)) return;
     const float len2=dir[0]*dir[0]+dir[2]*dir[2];
-    if (!(len2>0.8f && len2<1.2f && dir[1]>-0.1f && dir[1]<0.1f && arc>-3.0f && arc<3.0f)) {
+    /* (measured 2026-11-11, chapter 12, hanging: the walking camera's direction is a unit vector pointing 35-40 degrees DOWN, (-0.8,-0.6,-0.1), so the horizontal part is ~0.6 and
+     * the test below refused it: the mouse stayed on the emulated stick. The turn only rotates x and z, y is kept, so a tilted unit direction is fine. BB_U3_TILTDIR=0: old test) */
+    static int tiltdir=-1; if (tiltdir<0) { const char *e=getenv("BB_U3_TILTDIR"); tiltdir=!(e && e[0]=='0'); }
+    const float n2=len2+dir[1]*dir[1];
+    const int level_ok=len2>0.8f && len2<1.2f && dir[1]>-0.1f && dir[1]<0.1f;
+    const int tilt_ok=tiltdir && n2>0.9f && n2<1.1f && len2>0.2f;
+    if (!((level_ok || tilt_ok) && arc>-3.0f && arc<3.0f)) {
         float ix, iy;
         if (mouse_debug()) { static uint64_t vt_us; if (now-vt_us>250000) { vt_us=now; printf("Mouse: U3 walk camera %llx implausible dir=(%.3f %.3f %.3f) arc=%.3f\n",(unsigned long long)camera,(double)dir[0],(double)dir[1],(double)dir[2],(double)arc); } }
         camera_take(0,&ix,&iy);
