@@ -4049,7 +4049,8 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         if (ok) { u3_aim_drake_off[0]=gx; u3_aim_drake_off[1]=gz; }
         u3_reuse_pending=0;
     }
-    pivot[0]+=u3_aim_drake_off[0]; pivot[2]+=u3_aim_drake_off[1];   /* (also while the aim fades out: the turn it kept is about the same pivot) */
+    const int turret_now=(u3_turret_us && now-u3_turret_us<100000);   /* (the turret's orbit centre is 2.33 m ahead of the camera, not the player: no player-based pivot correction there) */
+    if (!turret_now) { pivot[0]+=u3_aim_drake_off[0]; pivot[2]+=u3_aim_drake_off[1]; }   /* (also while the aim fades out: the turn it kept is about the same pivot) */
     int hold_fresh=0;
     {   /* A camera that appears with the aim already held (weapon change) starts from a pose coming from ~3 m away: the pivot worked out from it jumps 0.45 m for a few frames and the picture goes away and comes back (measured 2026-11-10; the pad does not read the pivot). Until it has settled (0.5 s) the pivot of the aim in progress is kept; the camera's offset from it is then whatever the raw pose gives. */
         static int fh=-1; if (fh<0) { const char *e=getenv("BB_U3_FRESHHOLD"); fh=!(e && e[0]=='0'); }   /* BB_U3_FRESHHOLD=0: off */
@@ -4070,7 +4071,7 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     {   /* The player's own position, read from the object the aiming camera follows (measured 2026-11-11: [camera+0xb0] is a handle -> object A, generation at A+0x7c; A+0x4d0 holds the player's feet position, A+0xf0 / A+0x1a0 the same a frame late). The pivot worked out from the camera with the nominal offset was 0.9-1.3 m off against a wall (the camera is pulled in), the true position is not; horizontal only, the height keeps the offset's. BB_U3_TRUEPIVOT=0: off. */
         static int tp=-1; if (tp<0) { const char *e=getenv("BB_U3_TRUEPIVOT"); tp=!(e && e[0]=='0'); }
         uint64_t hp=0, A=0; uint32_t gen=0, ag=0; float pp[3];
-        if (tp && u3_probe_aim_cam && safe_read(&hp,u3_probe_aim_cam+0xb0,8) && safe_read(&gen,u3_probe_aim_cam+0xb8,4) && hp && gen && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && ag==gen && safe_read(pp,A+0x4d0,12)) {
+        if (tp && !turret_now && u3_probe_aim_cam && safe_read(&hp,u3_probe_aim_cam+0xb0,8) && safe_read(&gen,u3_probe_aim_cam+0xb8,4) && hp && gen && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && ag==gen && safe_read(pp,A+0x4d0,12)) {
             const float gx=pp[0]-pivot[0], gz=pp[2]-pivot[2];
             if (pp[0]>-100000.0f && pp[0]<100000.0f && pp[2]>-100000.0f && pp[2]<100000.0f && gx*gx+gz*gz<9.0f) {
                 if (mouse_debug()) { static uint64_t tpu; if (now-tpu>300000) { tpu=now; printf("Mouse: U3 TRUEPIVOT T=%.4f player=%.3f,%.3f nominal=%.3f,%.3f gap=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[2],(double)pivot[0],(double)pivot[2],(double)gx,(double)gz); } }
@@ -4079,6 +4080,19 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         }
     }
     if (!blending_out) { for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i]; u3_aim_pivot_us=now; }
+    if (mouse_debug() && turret_now && r14) {   /* (diagnostic, turret) the player object reached from the turret camera: does [r14+0xb0] give it, and is its orientation (A+0xe0) the turret's heading? */
+        static uint64_t tu; if (now-tu>40000) { tu=now;
+            uint64_t hp=0, A=0; uint32_t gen=0, ag=0; float q[4]={0}, pp[3]={0}, p2[3]={0}, q2[4]={0};
+            const int a=safe_read(&hp,r14+0xb0,8) && safe_read(&gen,r14+0xb8,4) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4);
+            if (a) { safe_read(q,A+0xe0,16); safe_read(pp,A+0x4d0,12); safe_read(p2,A+0xd0,12); safe_read(q2,A+0x1b0,16); }
+            const float h0=SDL_atan2f(2.0f*(q[3]*q[1]+q[0]*q[2]),1.0f-2.0f*(q[1]*q[1]+q[2]*q[2]))*57.29578f;
+            printf("Mouse: U3 TURRETA T=%.4f ok=%d A=%llx gen=%u/%u pos=%.2f,%.2f,%.2f q=%.3f,%.3f,%.3f,%.3f h=%.1f shown_raw_base=%.1f\n",now*1e-6,a,(unsigned long long)A,gen,ag,(double)pp[0],(double)pp[1],(double)pp[2],(double)q[0],(double)q[1],(double)q[2],(double)q[3],(double)h0,(double)(SDL_atan2f(f[0],f[2])*57.29578f));
+            (void)p2; (void)q2; }
+        static FILE *tdf; static int tdi; if (!tdi) { tdi=1; const char *e=getenv("BB_U3_TURRETDUMP"); if (e && e[0]) tdf=fopen(e,"wb"); }   /* (turret camera object, 0x1000 bytes per record: float h, then the bytes) */
+        if (tdf) { static uint64_t tdu; if (now-tdu>30000) { tdu=now; static unsigned char tb[0x1000]; float hh=SDL_atan2f(f[0],f[2])*57.29578f; if (safe_read(tb,r14,sizeof tb)) { fwrite(&hh,4,1,tdf); fwrite(tb,1,sizeof tb,tdf);
+            static const int po[]={0x148,0x160,0x168,0x170,0x208,0x210,0x220,0x3c8,0x3e8,0x3f0,0x5a0,0x5f8,0x650,0x658,0x780,0x8a0};   /* (pointers found in the first dump: each target, 0x400 bytes) */
+            for (unsigned k=0;k<sizeof po/sizeof po[0];++k) { uint64_t pv=0; static unsigned char pb[0x400]; memset(pb,0,sizeof pb); memcpy(&pv,tb+po[k],8); pv&=~0xfULL; if (pv>0x10000000ULL) safe_read(pb,pv,sizeof pb); fwrite(pb,1,sizeof pb,tdf); }
+            fflush(tdf); } } } }
     if (mouse_debug() && !blending_out && r14) {   /* (diagnostic, BB_U3_AIMDUMP=1) the aiming camera's object at the start of an aim and 1.2 s later: looking for the player's live position in it */
         static int dd=-1; if (dd<0) { const char *e=getenv("BB_U3_AIMDUMP"); dd=(e && e[0]=='1'); }
         static uint64_t t0; static int done;
@@ -4155,11 +4169,16 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
          * mouse's turn then; what we turn the game's pose by is therefore base - (ref - total), whatever the stick made the game's heading do. Measured
          * 2026-11-11 (BB_U3_STICKTEST): right stick 0.5 = 32 deg/s, starts and stops within 0.1 s. */
         static int ch=-1; if (ch<0) { const char *e=getenv("BB_U3_CHASE"); ch=!(e && e[0]=='0'); }   /* BB_U3_CHASE=0: off (the old behaviour: the game's heading stays put, the camera against a wall keeps the distance of the untouched heading) */
-        const int allowed=ch && !blending_out && !u3_aim_from_cover && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000) &&
+        static int chase_turret=-1; if (chase_turret<0) { const char *e=getenv("BB_U3_CHASETURRET"); chase_turret=!(e && e[0]=='0'); }   /* turret: Drake/the turret follow the game's heading, not ours (2026-11-11 FP log: the final pose orbits the same centre as with the pad). BB_U3_CHASETURRET=0: off */
+        const int allowed=ch && !blending_out && !u3_aim_from_cover && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000 && !chase_turret) &&
                           !(u3_swap_press_us && now-u3_swap_press_us<1500000) && !(u3_roll_press_us && now-u3_roll_press_us<2000000);
         if (allowed) {
             if (was_out || !u3_chase_ok) { u3_chase_ref=base_heading+*total_yaw; u3_chase_ok=1; }
             yaw_use=wrap_degrees(base_heading-(u3_chase_ref-*total_yaw));
+            if (u3_turret_us && now-u3_turret_us<100000) {   /* turret: it turns at ~90 deg/s at most, Drake stays with it. The camera may lead it by TURRETLEAD degrees (the mouse stays 1:1 inside that), no further: the camera stays behind Drake as with the pad */
+                static float lead=-1.0f; if (lead<0.0f) { const char *e=getenv("BB_U3_TURRETLEAD"); lead=e && e[0] ? (float)atof(e) : 8.0f; }
+                if (yaw_use>lead || yaw_use<-lead) { yaw_use=yaw_use>0.0f ? lead : -lead; *total_yaw=yaw_use-base_heading+u3_chase_ref; }
+            }
             u3_chase_last_yaw=yaw_use;
             static float pos_f=-1.0f; if (pos_f<0.0f) { const char *e=getenv("BB_U3_CHASEPOS"); pos_f=e && e[0] ? (float)atof(e) : 1.0f; }   /* 1 = the camera's position turned by the whole gap (0 left Drake off-centre: tested 2026-11-11) */
             u3_chase_pos_yaw=pos_f*yaw_use;
