@@ -3660,7 +3660,15 @@ static float u3_cover_rend_off; static uint64_t u3_cover_rend_us, u3_cover_lastf
 static float u3_tk_h, u3_tk_e, u3_tk_k; static uint64_t u3_tk_key, u3_tk_start_us;   /* the cover has been left (key: its last frame): the heading / elevation the picture goes on from, turned by the mouse, while the walking camera's own pose settles (u3_cover_exit_layer) */
 static volatile uint64_t u3_probe_aim_cam;   /* the aiming camera object, compared (never written) at the end of the layer blend */
 static float u3_dbg_dx, u3_dbg_dy;   /* the raw mouse pixels taken by the last update of the aiming camera (BB_MOUSE_DEBUG trace) */
-static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) { (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera; }
+static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
+    (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
+    static int pi=-1; if (pi<0) { const char *e=getenv("BB_U3_AIMPROBE"); pi=(e && e[0]); }
+    if (pi && aim_held) {   /* (probe) the processed stick the game hands its aiming camera: the input struct is rdx at the function's start, +0x74 / +0x78 = the two stick axes it copies to camera+0x1250 / +0x1254 */
+        const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+        float in[8]={0};
+        if (safe_read(in,g->rdx+0x70,32)) printf("Mouse: U3 AIMIN T=%.4f cam=%llx x=%.5f y=%.5f raw=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",now_us()*1e-6,(unsigned long long)camera,(double)in[1],(double)in[2],(double)in[0],(double)in[3],(double)in[4],(double)in[5],(double)in[6],(double)in[7]);
+    }
+}
 static void __attribute__((ms_abi)) u3_cover_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)image; (void)r14;
     u3_cover_seen_us=now_us(); u3_cover_cam=camera;
@@ -3723,6 +3731,10 @@ static void quat_rotate(const float *q, const float *v, float *r) {   /* q v q^-
 static const float u3_s_cand[4][3]={{-0.4f,0.475f,-1.0f},{0.3f,0.5f,-1.0f},{-0.54f,0.475f,-1.43f},{0.41f,0.5f,-1.43f}};
 static int u3_s_pick; static unsigned u3_s_epoch=1;
 static uint64_t u3_aim_pivot_us;   /* when u3_aim_pivot was last set by the aiming output */
+static uint64_t u3_move_us;   /* last time a movement key / the left stick was pushed (the mouse does not count) */
+/* A new aim soon after the last one, the player not having moved: the pivot of the last aim is kept (measured 2026-11-11 against a wall: the pivot worked out from the new camera
+ * with the nominal shoulder offset was 0.9 m off the player, the first aim's was right; the pad was fine). Once the camera has settled its offset from that pivot is taken as its shoulder offset. */
+static int u3_reuse_pending, u3_reuse_ok; static uint64_t u3_reuse_t0, u3_reuse_cam; static float u3_reuse_p[3], u3_reuse_s[3];
 static const float *u3_shoulder_for(uint64_t cam, const float *o, uint64_t now) {
     static struct { uint64_t cam, us; float s[3]; unsigned cal; int cls; } slot[2];
     static float hold[3]; static uint64_t hold_key;
@@ -3737,7 +3749,20 @@ static const float *u3_shoulder_for(uint64_t cam, const float *o, uint64_t now) 
         const float conj[4]={-o[4],-o[5],-o[6],o[7]}, d[3]={o[0]-hold[0],o[1]-hold[1],o[2]-hold[2]};
         float s[3];
         quat_rotate(conj,d,s);
-        if (s[0]>-2.0f && s[0]<2.0f && s[1]>-2.0f && s[1]<2.0f && s[2]>-3.0f && s[2]<0.0f) {
+        static int sg=-1; if (sg<0) { const char *e=getenv("BB_U3_SHOULDERGATE"); sg=!(e && e[0]=='0'); }   /* BB_U3_SHOULDERGATE=0: off */
+        int wall_squashed=0;
+        if (sg) {   /* against a wall the game pulls the camera in: an offset measured then is shorter than the weapon's and, kept, left the pivot off for good (reported 2026-11-11). Its length is checked against the candidate of this weapon; only the side is kept then. */
+            const float *c=u3_s_cand[cls+(s[0]>0.0f ? 1 : 0)];
+            const float lc=SDL_sqrtf(c[0]*c[0]+c[2]*c[2]), lm=SDL_sqrtf(s[0]*s[0]+s[2]*s[2]);
+            /* (measured 2026-11-11: against a wall the depth is squashed to -0.25 while the side stays 0.9, length 0.96 vs 1.04 passed the length test alone: each component is checked) */
+            wall_squashed=(lm<lc-0.15f || lm>lc+0.15f || SDL_fabsf(s[0]-c[0])>0.3f || SDL_fabsf(s[2]-c[2])>0.3f);
+            if (wall_squashed && hold_key==u3_swap_press_us && mouse_debug()) { static uint64_t pr; if (now-pr>100000) { pr=now; printf("Mouse: U3 SHOULDER rejected T=%.4f cam=%llx len=%.3f expected=%.3f s=%.3f,%.3f,%.3f\n",now*1e-6,(unsigned long long)cam,(double)lm,(double)lc,(double)s[0],(double)s[1],(double)s[2]); } }
+        }
+        if (wall_squashed && s[0]>-2.0f && s[0]<2.0f) {
+            u3_s_pick=(u3_s_pick&~1)|(s[0]>0.0f ? 1 : 0);
+            u3_aim_drake_off[0]=u3_aim_drake_off[1]=0.0f;
+        }
+        else if (s[0]>-2.0f && s[0]<2.0f && s[1]>-2.0f && s[1]<2.0f && s[2]>-3.0f && s[2]<0.0f) {
             for (int i=0;i<3;++i) slot[k].s[i]=s[i];
             slot[k].cal=u3_s_epoch; slot[k].cls=cls;
             u3_s_pick=(u3_s_pick&~1)|(s[0]>0.0f ? 1 : 0);   /* (the shoulder side the switch measured: a weapon change after it starts from the right candidate) */
@@ -3759,6 +3784,7 @@ static const float *u3_shoulder_for(uint64_t cam, const float *o, uint64_t now) 
             if (d[0]>d[1]+0.1f) cls=2; else if (d[1]>d[0]+0.1f) cls=0;
         }
     }
+    if (u3_reuse_ok && cam==u3_reuse_cam && !(slot[k].cal==u3_s_epoch && slot[k].cls==cls) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) return u3_reuse_s;
     return slot[k].cal==u3_s_epoch && slot[k].cls==cls ? slot[k].s : u3_s_cand[cls+(u3_s_pick&1)];
 }
 /* A shoulder switch restarts the aiming camera from the pose we left in its output (turned by the whole mouse turn): its raw pose then already has the turn and our total
@@ -3787,6 +3813,42 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
     const uint64_t now=now_us();
+    {   /* (probe, BB_U3_AIMPROBE=<file>) every frame of the aim, pad or mouse, read only: the output pose and the camera object, to find the game's own aim angles (what the stick turns) */
+        static FILE *pf; static int pi=-1;
+        if (pi<0) { const char *e=getenv("BB_U3_AIMPROBE"); pi=(e && e[0]); if (pi) pf=fopen(e,"wb"); if (!pf) pi=0; }
+        if (pi && aim_held && r14) {
+            const RuntimeGuestRegs *pg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            const float *po=(const float *)(uintptr_t)pg->rbx;
+            float pv[8]; static float buf[2048];
+            const uint64_t camobj=u3_probe_aim_cam ? u3_probe_aim_cam : r14;   /* (the real camera object: r14 here is the input pose struct) */
+            if ((uintptr_t)po>=0x10000 && safe_read(pv,(uint64_t)(uintptr_t)po,sizeof pv) && safe_read(buf,camobj,sizeof buf)) {
+                const double t=now*1e-6; const uint64_t cam=camobj;
+                { float f3[3]; quat_rotate(pv+4,(const float[3]){0.0f,0.0f,1.0f},f3); printf("Mouse: U3 AIMHEAD T=%.4f cam=%llx h=%.3f e=%.3f\n",t,(unsigned long long)cam,(double)(SDL_atan2f(f3[0],f3[2])*57.29578f),(double)(SDL_asinf(f3[1]>1.0f ? 1.0f : f3[1]<-1.0f ? -1.0f : f3[1])*57.29578f)); }
+                {   /* the player object the camera follows (see the true pivot): its first 0x1000 bytes, to find what holds the aim direction */
+                    static FILE *af; static int ai=-1;
+                    if (ai<0) { char nm[600]; const char *e=getenv("BB_U3_AIMPROBE"); snprintf(nm,sizeof nm,"%s.A",e); af=fopen(nm,"wb"); ai=af!=NULL; }
+                    uint64_t hp=0, A=0; static float abuf[1024];
+                    if (ai && u3_probe_aim_cam && safe_read(&hp,u3_probe_aim_cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(abuf,A,sizeof abuf)) {
+                        fwrite(&t,8,1,af); fwrite(pv,4,8,af); fwrite(abuf,4,1024,af); fflush(af);
+                    }
+                }
+                fwrite(&t,8,1,pf); fwrite(&cam,8,1,pf); fwrite(pv,4,8,pf); fwrite(buf,4,2048,pf);
+                /* (the objects the first 0x600 bytes point to: the aim angles may live in a controller / aim object) */
+                uint32_t np=0; long pos=ftell(pf); fwrite(&np,4,1,pf);
+                const uint64_t *q=(const uint64_t *)buf;
+                for (int i=0;i<0xc0 && np<24;++i) {
+                    const uint64_t v=q[i];
+                    if (v<0x100000000ull || v>0x7fffffffffull || (v&7)) continue;
+                    static unsigned char blk[0x200];
+                    if (!safe_read(blk,v,sizeof blk)) continue;
+                    const uint32_t src=(uint32_t)(i*8);
+                    fwrite(&src,4,1,pf); fwrite(&v,8,1,pf); fwrite(blk,1,sizeof blk,pf); ++np;
+                }
+                { long end=ftell(pf); fseek(pf,pos,SEEK_SET); fwrite(&np,4,1,pf); fseek(pf,end,SEEK_SET); }
+                fflush(pf);
+            }
+        }
+    }
     if (disabled || pad_only_mode) return;
     static int prev_out=1;
     const int was_out=prev_out;
@@ -3854,6 +3916,37 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         }
         /* (a weapon change with the aim held has no first frame: u3_shoulder_for reads the field of view of each camera on every frame) */
     }
+    {   /* pivot of the last aim kept for a new aim soon after it (BB_U3_AIMREUSE=0: off) */
+        static int ar=-1; if (ar<0) { const char *e=getenv("BB_U3_AIMREUSE"); ar=(e && e[0]=='1'); }   /* OFF by default since 2026-11-11: the walking camera's pivot was 0.26 m from the aiming camera in one measured aim (the real distance is >= 1.08 m): not the player, the correction made it worse. BB_U3_AIMREUSE=1 = on */
+        if (!blending_out) {
+            if (was_out) {
+                u3_reuse_ok=0; u3_reuse_pending=0;
+                /* (measured 2026-11-11: with the player standing still the walking camera's pivot +0x78a0 is within 2 cm of the pivot that is right; the pivot worked out from the aiming camera with the nominal offset was 0.9-1.3 m off against a wall. It lags behind a moving player: only used when no movement for 1 s and the walking camera has updated since) */
+                if (ar && u3_walk_pivot_ok && u3_walk_update_us && now>u3_walk_update_us && now-u3_walk_update_us<300000 && (!u3_move_us || now-u3_move_us>400000) && !(u3_turret_us && now-u3_turret_us<100000) && !(u3_cover_seen_us && now-u3_cover_seen_us<300000) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+                    u3_reuse_pending=1; u3_reuse_t0=now;
+                    for (int i=0;i<3;++i) u3_reuse_p[i]=u3_walk_pivot_last[i];
+                }
+                else if (mouse_debug()) printf("Mouse: U3 AIMREUSE T=%.4f not tried: walk_ok=%d walk_age=%.2fs move_age=%.2fs\n",now*1e-6,u3_walk_pivot_ok,u3_walk_update_us ? (double)(now-u3_walk_update_us)*1e-6 : -1.0,u3_move_us ? (double)(now-u3_move_us)*1e-6 : -1.0);
+            }
+            if (u3_reuse_pending) {
+                static struct { uint64_t cam, us; float p[3]; } rs[2];
+                if ((u3_swap_press_us && now-u3_swap_press_us<1500000) || now-u3_reuse_t0>2000000) u3_reuse_pending=0;
+                else {
+                    int k=-1;
+                    for (int i=0;i<2;++i) if (rs[i].cam==r14) k=i;
+                    if (k<0) { k=rs[0].us<=rs[1].us ? 0 : 1; rs[k].cam=r14; rs[k].us=0; }
+                    const float dx=o[0]-rs[k].p[0], dy=o[1]-rs[k].p[1], dz=o[2]-rs[k].p[2];
+                    float cw=0.0f; if (!safe_read(&cw,r14+0x108,4)) cw=0.0f;
+    (void)dx; (void)dy; (void)dz;
+                    static uint64_t cwp; if (mouse_debug() && now-cwp>400000) { cwp=now; printf("Mouse: U3 AIMREUSE T=%.4f waiting cam=%llx cw=%.3f age=%.2fs\n",now*1e-6,(unsigned long long)r14,(double)cw,(double)(now-u3_reuse_t0)*1e-6); }
+                    const int steady=now-u3_reuse_t0>300000;   /* (the weight read at +0x108 of this camera is not the blend's: timed instead, the blend takes ~0.3 s) */   /* (blended in fully; a test on the pose standing still never held, the mouse turns it: no "applied" in the 2026-11-11 journal. At the very first frames the camera is still, before it moves: a gap taken then was wrong for the whole aim) */
+                    rs[k].us=now; for (int i=0;i<3;++i) rs[k].p[i]=o[i];
+                    if (steady) u3_reuse_cam=r14;   /* (the gap is taken below, once the pivot is worked out from this settled camera) */
+                    else if (u3_reuse_cam==r14) u3_reuse_cam=0;
+                }
+            }
+        }
+    }
     const float look[3]={0.0f,0.0f,1.0f};
     static const float turret_shoulder[3]={0.0f,0.0f,-2.33f};   /* (turret camera: orbit centre 2.33 m straight ahead) */
     const float *shoulder=u3_turret_us && now-u3_turret_us<100000 ? turret_shoulder : u3_shoulder_for(r14,o,now);
@@ -3892,6 +3985,13 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
             }
         }
     }
+    if (!blending_out && u3_reuse_pending && u3_reuse_cam==r14) {   /* settled camera: the player's place (walking camera's pivot, player still) replaces the one worked out with the nominal offset */
+        const float gx=u3_reuse_p[0]-pivot[0], gz=u3_reuse_p[2]-pivot[2];
+        const int ok=gx*gx+gz*gz<4.0f;
+        if (mouse_debug()) { const float wx=o[0]-u3_reuse_p[0], wz=o[2]-u3_reuse_p[2], nx=o[0]-pivot[0], nz=o[2]-pivot[2]; printf("Mouse: U3 AIMREUSE T=%.4f cam=%llx gap %.3f,%.3f (%s) camera-to-walk-pivot %.3f, camera-to-nominal-pivot %.3f\n",now*1e-6,(unsigned long long)r14,(double)gx,(double)gz,ok ? "applied" : "too far, ignored",(double)SDL_sqrtf(wx*wx+wz*wz),(double)SDL_sqrtf(nx*nx+nz*nz)); }
+        if (ok) { u3_aim_drake_off[0]=gx; u3_aim_drake_off[1]=gz; }
+        u3_reuse_pending=0;
+    }
     pivot[0]+=u3_aim_drake_off[0]; pivot[2]+=u3_aim_drake_off[1];   /* (also while the aim fades out: the turn it kept is about the same pivot) */
     int hold_fresh=0;
     {   /* A camera that appears with the aim already held (weapon change) starts from a pose coming from ~3 m away: the pivot worked out from it jumps 0.45 m for a few frames and the picture goes away and comes back (measured 2026-11-10; the pad does not read the pivot). Until it has settled (0.5 s) the pivot of the aim in progress is kept; the camera's offset from it is then whatever the raw pose gives. */
@@ -3910,6 +4010,17 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
             if (mouse_debug()) { static uint64_t pu; if (now-pu>100000) { pu=now; printf("Mouse: U3 FRESHHOLD T=%.4f cam=%llx age=%.0fms pivot kept\n",now*1e-6,(unsigned long long)r14,(double)(now-seen[k].first)*1e-3); } }
         }
     }
+    {   /* The player's own position, read from the object the aiming camera follows (measured 2026-11-11: [camera+0xb0] is a handle -> object A, generation at A+0x7c; A+0x4d0 holds the player's feet position, A+0xf0 / A+0x1a0 the same a frame late). The pivot worked out from the camera with the nominal offset was 0.9-1.3 m off against a wall (the camera is pulled in), the true position is not; horizontal only, the height keeps the offset's. BB_U3_TRUEPIVOT=0: off. */
+        static int tp=-1; if (tp<0) { const char *e=getenv("BB_U3_TRUEPIVOT"); tp=!(e && e[0]=='0'); }
+        uint64_t hp=0, A=0; uint32_t gen=0, ag=0; float pp[3];
+        if (tp && u3_probe_aim_cam && safe_read(&hp,u3_probe_aim_cam+0xb0,8) && safe_read(&gen,u3_probe_aim_cam+0xb8,4) && hp && gen && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && ag==gen && safe_read(pp,A+0x4d0,12)) {
+            const float gx=pp[0]-pivot[0], gz=pp[2]-pivot[2];
+            if (pp[0]>-100000.0f && pp[0]<100000.0f && pp[2]>-100000.0f && pp[2]<100000.0f && gx*gx+gz*gz<9.0f) {
+                if (mouse_debug()) { static uint64_t tpu; if (now-tpu>300000) { tpu=now; printf("Mouse: U3 TRUEPIVOT T=%.4f player=%.3f,%.3f nominal=%.3f,%.3f gap=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[2],(double)pivot[0],(double)pivot[2],(double)gx,(double)gz); } }
+                pivot[0]=pp[0]; pivot[2]=pp[2];
+            }
+        }
+    }
     if (!blending_out) { for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i]; u3_aim_pivot_us=now; }
     if (mouse_debug() && !blending_out && r14) {   /* (diagnostic, BB_U3_AIMDUMP=1) the aiming camera's object at the start of an aim and 1.2 s later: looking for the player's live position in it */
         static int dd=-1; if (dd<0) { const char *e=getenv("BB_U3_AIMDUMP"); dd=(e && e[0]=='1'); }
@@ -3925,6 +4036,31 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
                     for (int i=0;i<384;i+=8) printf("Mouse: U3 DUMPF %d phase=%d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",i*4,phase,(double)buf[i],(double)buf[i+1],(double)buf[i+2],(double)buf[i+3],(double)buf[i+4],(double)buf[i+5],(double)buf[i+6],(double)buf[i+7]);
                 }
             }
+        }
+    }
+    if (mouse_debug() && !blending_out && u3_probe_aim_cam) {   /* (diagnostic) the aiming camera's own anchor: a cached locator of the target (+0x11a0 position, +0x11b0 quaternion), an offset in its frame (+0x11c0), and a world offset (+0x1240): the game's 0x50d080 (found 2026-11-11) adds them */
+        static uint64_t loc_us;
+        if (now-loc_us>200000 || was_out) {
+            loc_us=now;
+            /* mode 0 (the one seen): the camera's handle [cam+0xb0] (generation [cam+0xb8]) gives an object A (generation at [A+0x7c]), whose locator cache is [A+0xd0] position / [A+0xe0] quaternion; fallback vector [A+0x4c0] */
+            uint64_t hp=0, A=0; uint32_t gen=0, ag=0; float lp[4]={0}, lq[4]={0}, fb[4]={0};
+            int ok=safe_read(&hp,u3_probe_aim_cam+0xb0,8) && safe_read(&gen,u3_probe_aim_cam+0xb8,4) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4);
+            if (ok) { safe_read(lp,A+0xd0,16); safe_read(lq,A+0xe0,16); safe_read(fb,A+0x4c0,16); }
+            if (ok) {   /* scan the target object for anything that looks like a position near the pivot worked out (x and z within 2.5 m of it, 8 bytes apart) */
+                static float ab[0x800/4];
+                if (safe_read(ab,A,sizeof ab)) {
+                    char line[1200]; int n=0; line[0]=0;
+                    for (int i=0;i+2<0x800/4 && n<1100-48;++i) {
+                        const float x=ab[i], z=ab[i+2];
+                        if (x>pivot[0]-2.5f && x<pivot[0]+2.5f && z>pivot[2]-2.5f && z<pivot[2]+2.5f) n+=snprintf(line+n,sizeof line-(size_t)n," +%#x(%.2f,%.2f,%.2f)",i*4,(double)x,(double)ab[i+1],(double)z);
+                    }
+                    printf("Mouse: U3 TARGETSCAN T=%.4f A=%llx nominal=%.3f,%.3f,%.3f hits:%s\n",now*1e-6,(unsigned long long)A,(double)pivot[0],(double)pivot[1],(double)pivot[2],line);
+                }
+            }
+            float tf[8]={0}; uint64_t hp2=0, Tp=0; uint32_t g2=0, tg=0;
+            if (ok && safe_read(&hp2,A+0xb8,8) && safe_read(&g2,A+0xc0,4) && hp2 && safe_read(&Tp,hp2,8) && Tp && safe_read(&tg,Tp+0x50,4)) safe_read(tf,Tp,32);
+            printf("Mouse: U3 TARGET T=%.4f A=%llx T=%llx tgen=%u/%u pos=%.3f,%.3f,%.3f,%.3f q=%.3f,%.3f,%.3f,%.3f\n",now*1e-6,(unsigned long long)A,(unsigned long long)Tp,tg,g2,(double)tf[0],(double)tf[1],(double)tf[2],(double)tf[3],(double)tf[4],(double)tf[5],(double)tf[6],(double)tf[7]);
+            printf("Mouse: U3 LOCATOR T=%.4f cam=%llx A=%llx gen_ok=%d loc=%.3f,%.3f,%.3f q=%.3f,%.3f,%.3f,%.3f fb=%.3f,%.3f,%.3f nominal=%.3f,%.3f,%.3f\n",now*1e-6,(unsigned long long)u3_probe_aim_cam,(unsigned long long)A,ok && ag==gen,(double)lp[0],(double)lp[1],(double)lp[2],(double)lq[0],(double)lq[1],(double)lq[2],(double)lq[3],(double)fb[0],(double)fb[1],(double)fb[2],(double)pivot[0],(double)pivot[1],(double)pivot[2]);
         }
     }
     if (mouse_debug() && !blending_out) {   /* (diagnostic) is the pivot on the player? the walking camera's pivot is, at its last update before the aim */
@@ -5515,8 +5651,23 @@ static const unsigned char u3_walk_camera_code[]={0x55,0x48,0x89,0xe5,0x41,0x57,
 static const unsigned char u3_cover_camera_code[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0x38,0x02,0x00,0x00,0x48,0x89,0xd3,0x49};
 static const unsigned char u3_aim_camera_code[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec,0xb8,0x02,0x00,0x00,0x49,0x89,0xd6,0x49};
 static const unsigned char u3_aim_out_code[]={0xc7,0x43,0x48,0x00,0x00,0x80,0xbf,0xc6,0x43,0x4c,0x00,0xe9,0xbc,0xe9,0xff,0xff};
+/* The game's look controller (0x5006f0..0x500a40, found 2026-11-11 by its stick processing (m-0.2)*1.25 clamped to 1): the stick moves a yaw target [+0x1e4] and a pitch target [+0x1e8]
+ * (clamped to [+0x24c, +0x250]), each smoothed by a spring into [+0x1f0] / [+0x1f4]; the speeds are [rdx+0x544] / [rdx+0x548]. Observation only for now (BB_U3_AIMPROBE). */
+static const unsigned char u3_look_state_code[]={0xc5,0xfa,0x10,0x83,0x30,0x02,0x00,0x00,0xc4,0xc1,0x7a,0x11,0x47,0x1c,0x8b,0x83};
+static void __attribute__((ms_abi)) u3_look_state(uint64_t rdi,uint64_t rsi, uint64_t image, uint64_t r14) {
+    (void)rdi; (void)rsi; (void)image; (void)r14;
+    static int on=-1; if (on<0) { const char *e=getenv("BB_U3_AIMPROBE"); on=(e && e[0]); }
+    if (!on) return;
+    static uint64_t last_us; const uint64_t tn=now_us(); if (tn-last_us<30000) return; last_us=tn;   /* (also outside the aim: which camera is it?) */
+    const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    float st[8]={0}, lim[2]={0}, sp[2]={0};
+    if (!safe_read(st,g->rbx+0x1e4,16) || !safe_read(&st[4],g->rbx+0x1f0,8)) return;
+    safe_read(lim,g->rbx+0x24c,8); safe_read(sp,g->rdx+0x544,8);
+    printf("Mouse: U3 LOOK aim=%d T=%.4f rbx=%llx y=%.5f p=%.5f ys=%.5f ps=%.5f lim=%.4f,%.4f speed=%.4f,%.4f\n",(int)aim_held,now_us()*1e-6,(unsigned long long)g->rbx,(double)st[0],(double)st[1],(double)st[4],(double)st[5],(double)lim[0],(double)lim[1],(double)sp[0],(double)sp[1]);
+}
 static const RuntimeGuestCallback guest_callbacks[]={
     {"U3 aiming camera (output)",0x515128,u3_aim_out_code,sizeof(u3_aim_out_code),7,u3_aim_out,NULL},
+    {"U3 look state (observe)",0x500a26,u3_look_state_code,sizeof(u3_look_state_code),8,u3_look_state,NULL},
     {"U3 layer blend (mouse)",0x10193f2,u3_layer_probe_code,sizeof(u3_layer_probe_code),7,u3_layer_blend,NULL},
     {"U3 walking camera (mouse)",0x4e8e40,u3_walk_camera_code,sizeof(u3_walk_camera_code),8,u3_walk_camera,NULL},
     {"U3 cover camera (seen)",0x4ce080,u3_cover_camera_code,sizeof(u3_cover_camera_code),8,u3_cover_camera_seen,NULL},
@@ -8119,7 +8270,7 @@ static void sample_host(PadData *d) {
         ly=0;
     }
     if (ly) d->left_y=(uint8_t)(ly<0 ? 0 : 255);
-    if (lx || ly || d->left_x<100 || d->left_x>156 || d->left_y<100 || d->left_y>156) u3_hand_us=now;   /* (the player's hand on the movement keys / stick or the mouse: u3_layer_blend's fade pin lets go) */
+    if (lx || ly || d->left_x<100 || d->left_x>156 || d->left_y<100 || d->left_y>156) { u3_hand_us=now; u3_move_us=now; }   /* (the player's hand on the movement keys / stick or the mouse: u3_layer_blend's fade pin lets go) */
     /* The walk key (configurable, none by default) held with the movement keys, outside the menus: the stick is pushed only part way */
     if (!menu_mode && (lx||ly) && action_down(A_WALK,k,mouse,now)) {
         /* stick deflection in percent of full (BB_WALK_STICK to tune): below the game's dead zone Drake stops (36 % did) */
