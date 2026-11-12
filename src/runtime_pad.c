@@ -3704,8 +3704,47 @@ static volatile uint64_t u3_sticktest_us;  /* (measure) when the aim last ran wi
 static volatile int u3_sticktest_rx=128;  /* (measure, BB_U3_STICKTEST) the right stick x the test is sending */
 static volatile uint64_t u3_probe_aim_cam;  /* the aiming camera object, compared (never written) at the end of the layer blend */
 static float u3_dbg_dx, u3_dbg_dy;   /* the raw mouse pixels taken by the last update of the aiming camera (BB_MOUSE_DEBUG trace) */
+static float u3_head_base, u3_head_elev; static uint64_t u3_head_base_us, u3_head_act_us;   /* (BB_U3_HEAD11E0) the pose heading the game produced on the last aiming update, and when */
+static float u3_aim_e0, u3_aim_total_pitch;
+static float u3_aim_h0, u3_aim_total_yaw;  static int u3_aim_from_cover, u3_aim_h0_ok;   /* (tentative redefinitions: the definitions follow) */
 static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
+    {   /* (test, BB_U3_HEAD11E0=1, 2026-11-12) the game's aim heading is the vector camera+0x11e0 (turned by the stick in 0x511370, read by 0x50bcb0 in this update):
+         * for an aim begun in cover, turn it ourselves by the mouse's turn since the last update, so the game's wall collision runs at our heading with no 85 deg/s cap.
+         * u3_aim_out's cover branch is absolute (shown = h0 - total) and measures the game's heading, so it needs no change. */
+        static int hv=-1; if (hv<0) { const char *e=getenv("BB_U3_HEAD11E0"); hv=!(e && e[0]=='0'); }   /* BB_U3_HEAD11E0=0: off (the old behaviour: our rotation of the output pose only) */
+        static float prev_target; static uint64_t prev_us;
+        const uint64_t tn=now_us();
+        if (hv && aim_held && u3_aim_from_cover && u3_aim_h0_ok && camera) {
+            const float target=u3_aim_h0-u3_aim_total_yaw;
+            u3_head_act_us=tn;
+            float d=0.0f;
+            static int closed=-1; if (closed<0) { const char *e=getenv("BB_U3_HEADCLOSED"); closed=!(e && e[0]=='0'); }   /* closed loop (default): turn 11e0 by the gap between the heading we want and the pose heading the game produced on the last update (the pose sits ~10 degrees off the direction), so u3_aim_out has nothing left to turn and the picture is the game's own pose, as with the pad. BB_U3_HEADCLOSED=0: turn by the mouse's delta only */
+            if (closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
+            else if (prev_us && tn>prev_us && tn-prev_us<100000) d=wrap_degrees(target-prev_target);
+            prev_target=target; prev_us=tn;
+            float v[4];
+            static int pitch_on=-1; if (pitch_on<0) { const char *e=getenv("BB_U3_HEADPITCH"); pitch_on=!(e && e[0]=='0'); }   /* the height too (11e0's y): the game's own pitch geometry, not our rotation of its pose. BB_U3_HEADPITCH=0: off */
+            float de=0.0f;
+            if (pitch_on && closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) {
+                float te=u3_aim_e0-u3_aim_total_pitch; if (te>75.0f) te=75.0f; if (te<-75.0f) te=-75.0f;
+                de=te-u3_head_elev;
+            }
+            if ((d!=0.0f || de!=0.0f) && safe_read(v,camera+0x11e0,16) && (v[0]*v[0]+v[2]*v[2])>0.0001f) {
+                const float r=d*0.017453293f, c=SDL_cosf(r), s=SDL_sinf(r);
+                float x=v[0]*c+v[2]*s, z=v[2]*c-v[0]*s;
+                if (de!=0.0f) {
+                    float hl=SDL_sqrtf(x*x+z*z), el=SDL_atan2f(v[1],hl)*57.29578f+de;
+                    if (el>80.0f) el=80.0f; if (el<-80.0f) el=-80.0f;
+                    const float er=el*0.017453293f, ce=SDL_cosf(er), se=SDL_sinf(er);
+                    x=x/hl*ce; z=z/hl*ce; v[1]=se;
+                }
+                v[0]=x; v[2]=z;
+                safe_write(camera+0x11e0,v,16);
+            }
+            if (mouse_debug()) { static uint64_t hp; if (tn-hp>100000) { hp=tn; printf("Mouse: U3 HEAD11E0 T=%.4f d=%.3f target=%.2f v11e0=%.3f,%.3f,%.3f yaw11e0=%.2f\n",tn*1e-6,(double)d,(double)target,(double)v[0],(double)v[1],(double)v[2],(double)(SDL_atan2f(v[0],v[2])*57.29578f)); } }
+        } else prev_us=0;
+    }
     static int pi=-1; if (pi<0) { const char *e=getenv("BB_U3_AIMPROBE"); pi=(e && e[0]); }
     if (pi && aim_held) {   /* (probe) the processed stick the game hands its aiming camera: the input struct is rdx at the function's start, +0x74 / +0x78 = the two stick axes it copies to camera+0x1250 / +0x1254 */
         const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
@@ -3857,6 +3896,17 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
     const uint64_t now=now_us();
+    if (mouse_debug() && aim_held && u3_probe_aim_cam) {   /* (BB_U3_HEAD11E0 trace, pad too) the game's output heading and distance to the player, 15 times a second */
+        static uint64_t hq2; if (now-hq2>66000) { hq2=now;
+            const RuntimeGuestRegs *pg=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+            float po[8]; uint64_t hp=0, A=0; float pv[4]={0}, v[4]={0}; uint32_t ag=0, gen=0;
+            if (safe_read(po,pg->rbx,sizeof po) && safe_read(&hp,u3_probe_aim_cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && safe_read(&gen,u3_probe_aim_cam+0xb8,4) && ag==gen && safe_read(pv,A+0x4d0,12)) {
+                float f3[3]; quat_rotate(po+4,(const float[3]){0.0f,0.0f,1.0f},f3);
+                safe_read(v,u3_probe_aim_cam+0x11e0,16);
+                const float rx=po[0]-pv[0], rz=po[2]-pv[2];
+                const float bh=SDL_atan2f(f3[0],f3[2])*57.29578f, toward=SDL_atan2f(-rx,-rz)*57.29578f;   /* the bearing of the player seen from the camera, against where the camera looks: where Drake sits on the screen (0 = centred) */
+                printf("Mouse: U3 HEADPAD T=%.4f base=%.2f yaw11e0=%.2f dist=%.3f cover=%d rel=%.1f lat=%.3f\n",now*1e-6,(double)bh,(double)(SDL_atan2f(v[0],v[2])*57.29578f),(double)SDL_sqrtf(rx*rx+rz*rz),u3_aim_from_cover,(double)wrap_degrees(toward-bh),(double)(rx*SDL_cosf(bh*0.017453293f)-rz*SDL_sinf(bh*0.017453293f)));
+            } } }
     {   /* (probe, BB_U3_AIMPROBE=<file>) every frame of the aim, pad or mouse, read only: the output pose and the camera object, to find the game's own aim angles (what the stick turns) */
         static FILE *pf; static int pi=-1;
         if (pi<0) { const char *e=getenv("BB_U3_AIMPROBE"); pi=(e && e[0]); if (pi) pf=fopen(e,"wb"); if (!pf) pi=0; }
@@ -4025,8 +4075,10 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         }
     }
     float *total_yaw=blending_out ? &u3_aim_keep_yaw : &u3_aim_total_yaw, *total_pitch=blending_out ? &u3_aim_keep_pitch : &u3_aim_total_pitch;
-    if (elevation-*total_pitch>80.0f) *total_pitch=elevation-80.0f;
-    if (elevation-*total_pitch<-80.0f) *total_pitch=elevation+80.0f;
+    if (!(u3_head_act_us && now>=u3_head_act_us && now-u3_head_act_us<100000)) {   /* (not while BB_U3_HEAD11E0 drives the game's own pitch: the pose then follows the target, so this clamp stopped the total at about +-40 degrees; the cover branch below clamps against e0) */
+        if (elevation-*total_pitch>80.0f) *total_pitch=elevation-80.0f;
+        if (elevation-*total_pitch<-80.0f) *total_pitch=elevation+80.0f;
+    }
     float off[3], pivot[3];
     quat_rotate(o+4,shoulder,off);
     for (int i=0;i<3;++i) pivot[i]=o[i]-off[i];
@@ -4082,6 +4134,40 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
                 pivot[0]=pp[0]; pivot[2]=pp[2];
             } else if (mouse_debug()) { static uint64_t tpr; if (now-tpr>300000) { tpr=now; printf("Mouse: U3 TRUEPIVOT REJECT T=%.4f A+4d0=%.3f,%.3f,%.3f A+1a0=?, nominal=%.3f,%.3f gap=%.3f,%.3f\n",now*1e-6,(double)pp[0],(double)pp[1],(double)pp[2],(double)pivot[0],(double)pivot[2],(double)gx,(double)gz); } }
         } else if (mouse_debug() && tp && !turret_now) { static uint64_t tpf; if (now-tpf>300000) { tpf=now; printf("Mouse: U3 TRUEPIVOT NOREAD T=%.4f cam=%llx hp=%llx gen=%u A=%llx ag=%u\n",now*1e-6,(unsigned long long)u3_probe_aim_cam,(unsigned long long)hp,(unsigned)gen,(unsigned long long)A,(unsigned)ag); } }
+    }
+    if (mouse_debug() && !blending_out && u3_aim_from_cover && u3_probe_aim_cam) {   /* (diagnostic, BB_U3_PIVOTPROBE=x,z) the game's aim in cover turns about a point ~0.65 m from the player (measured 2026-11-12 with the pad): look for floats near that point in the player's object (A, 0xa00 bytes) and in the camera (0x600 bytes), once a second */
+        static int pp_on=-1; static float pp_x, pp_z;
+        if (pp_on<0) { const char *e=getenv("BB_U3_PIVOTPROBE"); pp_on=(e && sscanf(e,"%f,%f",&pp_x,&pp_z)==2); }
+        static uint64_t ppu;
+        if (pp_on && now-ppu>1000000) {
+            ppu=now;
+            uint64_t hp2=0, A2=0; static unsigned char buf[0xa00];
+            const uint64_t srcs[2]={u3_probe_aim_cam,(safe_read(&hp2,u3_probe_aim_cam+0xb0,8) && hp2 && safe_read(&A2,hp2,8)) ? A2 : 0};
+            const unsigned sizes[2]={0x600,0xa00};
+            for (int s=0;s<2;++s) {
+                if (!srcs[s] || !safe_read(buf,srcs[s],sizes[s])) continue;
+                for (unsigned o2=0;o2+4<=sizes[s];o2+=4) {
+                    float v; memcpy(&v,buf+o2,4);
+                    if (fabsf(v-pp_x)<0.25f) printf("Mouse: U3 PIVOTPROBE %s+%#x X=%.3f (target %.2f)\n",s ? "player" : "camera",o2,(double)v,(double)pp_x);
+                    if (fabsf(v-pp_z)<0.25f) printf("Mouse: U3 PIVOTPROBE %s+%#x Z=%.3f (target %.2f)\n",s ? "player" : "camera",o2,(double)v,(double)pp_z);
+                }
+            }
+        }
+    }
+    if (mouse_debug() && !blending_out && u3_probe_aim_cam) {   /* (diagnostic, BB_U3_AIMQ=1) does the player's orientation quaternion A+0xe0 (the anchor 0x513890 turns the camera's offset by) follow the aim heading? yaw of A+0xe0, of A+0x1b0, and the pose heading, 10 times a second */
+        static int aq=-1; if (aq<0) { const char *e=getenv("BB_U3_AIMQ"); aq=(e && e[0]=='1'); }
+        static uint64_t aqu;
+        if (aq && now-aqu>100000) {
+            aqu=now;
+            uint64_t hp3=0, A3=0; uint32_t gen3=0, ag3=0; float q3[4]={0}, q4[4]={0};
+            if (safe_read(&hp3,u3_probe_aim_cam+0xb0,8) && safe_read(&gen3,u3_probe_aim_cam+0xb8,4) && hp3 && safe_read(&A3,hp3,8) && A3 && safe_read(&ag3,A3+0x7c,4) && ag3==gen3) {
+                safe_read(q3,A3+0xe0,16); safe_read(q4,A3+0x1b0,16);
+                const float y3=SDL_atan2f(2.0f*(q3[3]*q3[1]+q3[0]*q3[2]),1.0f-2.0f*(q3[1]*q3[1]+q3[2]*q3[2]))*57.29578f;
+                const float y4=SDL_atan2f(2.0f*(q4[3]*q4[1]+q4[0]*q4[2]),1.0f-2.0f*(q4[1]*q4[1]+q4[2]*q4[2]))*57.29578f;
+                float fw[3]; const float fz[3]={0.0f,0.0f,1.0f}; quat_rotate(o+4,fz,fw);
+                printf("Mouse: U3 AIMQ T=%.4f e0=%.1f(|q|=%.2f) b1=%.1f pose_h=%.1f cover=%d\n",now*1e-6,(double)y3,(double)SDL_sqrtf(q3[0]*q3[0]+q3[1]*q3[1]+q3[2]*q3[2]+q3[3]*q3[3]),(double)y4,(double)(SDL_atan2f(fw[0],fw[2])*57.29578f),u3_aim_from_cover);
+            }
+        }
     }
     if (!blending_out) { for (int i=0;i<3;++i) u3_aim_pivot[i]=pivot[i]; u3_aim_pivot_us=now; }
     if (mouse_debug() && turret_now && r14) {   /* (diagnostic, turret) the player object reached from the turret camera: does [r14+0xb0] give it, and is its orientation (A+0xe0) the turret's heading? */
@@ -4154,6 +4240,17 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     const float base_heading=SDL_atan2f(f[0],f[2])*57.29578f;
     static float base_at_release;
     (void)base_at_release;
+    if (!blending_out) { u3_head_base=base_heading; u3_head_elev=elevation; u3_head_base_us=now; }
+    if (mouse_debug() && !blending_out) {   /* (BB_U3_HEAD11E0 trace) the game's own output: heading, distance to the pivot and the heading it was asked for (11e0) */
+        static uint64_t hq; if (now-hq>60000) { hq=now; float v[4]={0}; if (u3_probe_aim_cam) safe_read(v,u3_probe_aim_cam+0x11e0,16);
+            const float rx=o[0]-pivot[0], rz=o[2]-pivot[2];
+            float pq[4]={0,0,0,1}, pp[4]={0}; int pidx=-1, pok=0;   /* the player object the game's table gives for this camera ([camera+0xe4]): P+0x4d0 read by 0x50afd6 as a quaternion, P+0x4c0 a position */
+            if (u3_probe_aim_cam && safe_read(&pidx,u3_probe_aim_cam+0xe4,4) && pidx>=0 && pidx<64) {
+                uint64_t hp=0, P=0; uint32_t gen=0, pg=0;
+                if (safe_read(&hp,runtime_image_base()+0x1bb9500+(uint64_t)pidx*16,8) && hp && safe_read(&gen,runtime_image_base()+0x1bb9500+(uint64_t)pidx*16+8,4) && safe_read(&P,hp,8) && P && safe_read(&pg,P+0x7c,4) && pg==gen && safe_read(pq,P+0x4d0,16) && safe_read(pp,P+0x4c0,16)) pok=1;
+            }
+            const float pfx=2.0f*(pq[0]*pq[2]+pq[3]*pq[1]), pfz=1.0f-2.0f*(pq[0]*pq[0]+pq[1]*pq[1]);
+            printf("Mouse: U3 HEADOUT T=%.4f base=%.2f yaw11e0=%.2f dist=%.3f dy=%.3f target=%.2f P=%d q4d0=%.3f,%.3f,%.3f,%.3f qyaw=%.2f p4c0=%.3f,%.3f,%.3f pivot=%.3f,%.3f\n",now*1e-6,(double)base_heading,(double)(SDL_atan2f(v[0],v[2])*57.29578f),(double)SDL_sqrtf(rx*rx+rz*rz),(double)(o[1]-pivot[1]),(double)wrap_degrees(u3_aim_h0-*total_yaw),pok,(double)pq[0],(double)pq[1],(double)pq[2],(double)pq[3],(double)(SDL_atan2f(pfx,pfz)*57.29578f),(double)pp[0],(double)pp[1],(double)pp[2],(double)pivot[0],(double)pivot[2]); } }
     float yaw_use=*total_yaw;
     float pitch_use=*total_pitch;
     if (mouse_debug() && !blending_out) { static uint64_t pu; if (was_out || now-pu>500000) { pu=now; printf("Mouse: U3 AIMOUT T=%.4f cam_e=%.2f total_pitch=%.2f e0=%.2f ok=%d from_cover=%d\n",now*1e-6,(double)elevation,(double)*total_pitch,(double)u3_aim_e0,u3_aim_h0_ok,u3_aim_from_cover); } }
@@ -4174,7 +4271,8 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
          * 2026-11-11 (BB_U3_STICKTEST): right stick 0.5 = 32 deg/s, starts and stops within 0.1 s. */
         static int ch=-1; if (ch<0) { const char *e=getenv("BB_U3_CHASE"); ch=!(e && e[0]=='0'); }   /* BB_U3_CHASE=0: off (the old behaviour: the game's heading stays put, the camera against a wall keeps the distance of the untouched heading) */
         static int chase_turret=-1; if (chase_turret<0) { const char *e=getenv("BB_U3_CHASETURRET"); chase_turret=!(e && e[0]=='0'); }   /* turret: Drake/the turret follow the game's heading, not ours (2026-11-11 FP log: the final pose orbits the same centre as with the pad). BB_U3_CHASETURRET=0: off */
-        const int allowed=ch && !blending_out && !u3_aim_from_cover && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000 && !chase_turret) &&
+        static int chase_cover=-1; if (chase_cover<0) { const char *e=getenv("BB_U3_CHASECOVER"); chase_cover=(e && e[0]=='1'); }   /* BB_U3_CHASECOVER=1 (test, 2026-11-12): also follow the heading by the stick when the aim began in cover (the wall behind Drake pulls the camera in at the game's heading) */
+        const int allowed=ch && !blending_out && (!u3_aim_from_cover || chase_cover) && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000 && !chase_turret) &&
                           !(u3_swap_press_us && now-u3_swap_press_us<1500000) && !(u3_roll_press_us && now-u3_roll_press_us<2000000);
         if (allowed) {
             if (was_out || !u3_chase_ok) { u3_chase_ref=base_heading+*total_yaw; u3_chase_ok=1; }
@@ -4384,10 +4482,33 @@ static void u3_cover_measure_rend(uint64_t now, float prev_h, float show_h) {
         if (dd>-40.0f && dd<40.0f) { u3_cover_rend_off=(u3_cover_rend_us && now-u3_cover_rend_us<500000) ? u3_cover_rend_off+0.2f*(dd-u3_cover_rend_off) : dd; u3_cover_rend_us=now; }
     }
 }
+/* The highest elevation (degrees, up positive) the mouse may give the cover camera: it orbits 3 m from its pivot, so looking up puts it under the floor (reported 2026-11-12); with the pad the game itself stops at ~12.4 (measured
+ * on the cover camera's own elevation). BB_U3_COVERUP=<degrees> (default 13); 80 = the old limit. */
+static float u3_cover_up_max(void) { static float v=-1000.0f; if (v<-999.0f) { const char *e=getenv("BB_U3_COVERUP"); v=e && e[0] ? (float)atof(e) : 80.0f; } return v; }   /* (default 80 = no stop: the camera slides on the floor, see u3_cover_floor) */
+/* The cover camera orbits 3 m from its pivot: looking up it would go under the floor. The floor is the player's feet (A+0x4d4, A = *[camera+0xb0], generation [A+0x7c] = [camera+0xb8]); the pose's height is held above it
+ * (BB_U3_COVERFLOOR=<metres above the feet>, default 0.3; -9 = off) while the direction stays the mouse's: the camera slides along the floor. */
+static int u3_player_feet(uint64_t cam, float *out3) {   /* the player's feet (A+0x4d0 xyz), A as in u3_cover_floor */
+    uint64_t hp=0, A=0; uint32_t ag=0, gen=0;
+    if (!cam || !(safe_read(&hp,cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && safe_read(&gen,cam+0xb8,4) && ag==gen && safe_read(out3,A+0x4d0,12))) return 0;
+    for (int i=0;i<3;++i) if (!(out3[i]>-100000.0f && out3[i]<100000.0f)) return 0;
+    return 1;
+}
+static void u3_cover_floor(uint64_t cam, float *p) {
+    static float margin=-1000.0f; if (margin<-999.0f) { const char *e=getenv("BB_U3_COVERFLOOR"); margin=e && e[0] ? (float)atof(e) : 0.3f; }
+    if (margin<=-8.0f || !cam) return;
+    uint64_t hp=0, A=0; uint32_t ag=0, gen=0; float feet=0.0f;
+    if (!(safe_read(&hp,cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && safe_read(&gen,cam+0xb8,4) && ag==gen && safe_read(&feet,A+0x4d4,4))) return;
+    if (!(feet>-100000.0f && feet<100000.0f)) return;
+    const float lo=feet+margin;
+    if (mouse_debug()) { static uint64_t fq; const uint64_t n=now_us(); if (n-fq>300000) { fq=n; printf("Mouse: U3 COVERFLOOR T=%.4f feet=%.3f cam_y=%.3f lo=%.3f%s\n",n*1e-6,(double)feet,(double)p[1],(double)lo,p[1]<lo ? " CLAMP" : ""); } }
+    if (p[1]<lo) p[1]=lo;
+}
 static void u3_cover_layer(uint64_t r14) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
     const uint64_t now=now_us();
+    static volatile int u3_cover_pad_reset;   /* the pad was in use: the picture is the game's own again (its pose moved with the stick), so the mouse's turn is dropped, else it is subtracted from a pose it never saw (looking up with the pad then moving the mouse put the view above Drake, clip 2026-11-12) */
+    if (pad_only_mode) u3_cover_pad_reset=1;
     if (disabled || pad_only_mode || !(u3_cover_seen_us && now-u3_cover_seen_us<100000)) { u3_cover_skip(0,u3_cover_seen_us ? (float)((now-u3_cover_seen_us)*1e-3) : -1.0f,0.0f); return; }
     static uint64_t last_us, frame_us;
     static uint64_t handoff_for;
@@ -4395,6 +4516,11 @@ static void u3_cover_layer(uint64_t r14) {
      * pose, for a while after the release (measured: 5 degrees in the 0.2 s before the next press), which a turn relative to that pose carried along
      * as extra rotation (the picture went about twice as far as the mouse). Before any aim the pose is still, relative and absolute are the same. */
     static float abs_h, abs_e; static int abs_mode;
+    if (u3_cover_pad_reset) {
+        static int pr=-1; if (pr<0) { const char *e=getenv("BB_U3_COVERPADRESET"); pr=(e && e[0]=='1'); }   /* OFF by default (no visible effect in the 2026-11-12 test); BB_U3_COVERPADRESET=1: on */
+        u3_cover_pad_reset=0;
+        if (pr) { u3_cover_yaw=u3_cover_pitch=0.0f; abs_mode=0; u3_cover_show_us=0; float ix, iy; camera_take(0,&ix,&iy); if (mouse_debug()) printf("Mouse: U3 cover PADRESET T=%.4f (pad in use: the mouse's turn is dropped)\n",now*1e-6); }
+    }
     const int aim_window=u3_aim_active_us && now-u3_aim_active_us<1500000;   /* an aim was let go less than 1.5 s ago (its camera fades out under, and this one comes back over it) */
     if (aim_held) {   /* the aim from cover is driven by the aim hooks */
         u2_native_us=now; last_us=now;
@@ -4453,6 +4579,30 @@ static void u3_cover_layer(uint64_t r14) {
     float f[3], arm[3], pivot[3];
     quat_rotate(cq,back,arm);
     for (int i=0;i<3;++i) pivot[i]=cp[i]-arm[i];
+    {   /* The pivot deduced as "position - 3 m ahead" is wrong as soon as the game shortens the camera (looking up with the pad, the floor pulls it in): it rose from 3 to 6 m above Drake and the mouse then orbited
+         * about that point (clip 2026-11-12). The true pivot is fixed in the world (it does NOT follow the player's feet while he slides along the cover): the last
+         * sane one (0.7 to 1.9 m above the feet) is kept and used while the deduced one is not. BB_U3_COVERPIVOT=0: the old deduction. */
+        static int cpv=-1; if (cpv<0) { const char *e=getenv("BB_U3_COVERPIVOT"); cpv=(e && e[0]=='1'); }   /* OFF by default: tried 2026-11-12, not validated in play (the pivot read from the camera object was still wrong for Wiktor); BB_U3_COVERPIVOT=1 to test */
+        static float good[3], good_feet[3]; static int goodok; static uint64_t good_us;   /* the last sane pivot, in the world (fallback), and where the player was then */
+        float feet[3];
+        if (cpv && u3_player_feet(r14,feet)) {
+            /* The game keeps the cover's pivot in its camera object (cam+0x360, copy at cam+0x4d0; found 2026-11-12 by searching the object for the deduced pivot: equal to 3 mm): read it, it does not depend on the camera being pulled in. */
+            float fp[3]; int field=0;
+            if (safe_read(fp,r14+0x360,12)) { const float fy=fp[1]-feet[1], fx=fp[0]-feet[0], fz=fp[2]-feet[2]; field=(fy>0.5f && fy<2.2f && fx*fx+fz*fz<9.0f); }
+            const float hy=pivot[1]-feet[1];
+            if (field) {
+                if (mouse_debug() && !(hy>0.7f && hy<1.9f)) { static uint64_t pq; if (now-pq>300000) { pq=now; printf("Mouse: U3 COVERPIVOT field %.3f,%.3f,%.3f used instead of the deduced %.3f,%.3f,%.3f (hy=%.2f)\n",(double)fp[0],(double)fp[1],(double)fp[2],(double)pivot[0],(double)pivot[1],(double)pivot[2],(double)hy); } }
+                for (int i=0;i<3;++i) { pivot[i]=fp[i]; good[i]=fp[i]; good_feet[i]=feet[i]; } goodok=1; good_us=now;
+            }
+            else if (hy>0.7f && hy<1.9f) { for (int i=0;i<3;++i) { good[i]=pivot[i]; good_feet[i]=feet[i]; } goodok=1; good_us=now; }   /* sane: remembered */
+            else {   /* no field and the deduced pivot is far off the player: the last sane one for the same cover (the player within 1.5 m of where it was seen), else the player's head */
+                const float gx=feet[0]-good_feet[0], gz=feet[2]-good_feet[2];
+                const int same=goodok && now-good_us<20000000 && gx*gx+gz*gz<2.25f;
+                if (same) { for (int i=0;i<3;++i) pivot[i]=good[i]; }
+                else { pivot[0]=feet[0]; pivot[1]=feet[1]+1.3f; pivot[2]=feet[2]; }
+            }
+        }
+    }
     quat_rotate(p+4,look,f);
     const float ef=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
     for (int i=0;i<3;++i) u3_cover_pivot[i]=pivot[i];
@@ -4467,7 +4617,7 @@ static void u3_cover_layer(uint64_t r14) {
     if (abs_mode) {
         /* p is the final picture (also while this camera comes back over the fading aim, its weight w rising 0 -> 1): it is put on the absolute heading. */
         const float hp=SDL_atan2f(f[0],f[2])*57.29578f;
-        if (abs_e>80.0f) abs_e=80.0f;
+        if (abs_e>u3_cover_up_max()) abs_e=u3_cover_up_max();   /* (the pad's own limit looking up: the orbit then goes under the floor) */
         if (abs_e<-80.0f) abs_e=-80.0f;
         {   /* (measured 2026-11-11 on 5 exits with Tab at the "jump of a few frames": on the cover's LAST frame the game copies the picture it renders into the cover camera, so yaw (= camera heading - abs_h) jumps by -offset
              * (-11.5 against 0.2), and the offset between the heading written to this layer and the one rendered goes with it: the next 2 frames showed the WRITTEN heading, +11.6 degrees, then fell back. When yaw jumps by -offset
@@ -4484,6 +4634,7 @@ static void u3_cover_layer(uint64_t r14) {
         u3_cover_yaw=wrap_degrees(hcq-abs_h); u3_cover_pitch=ecq-abs_e;
         { const float prev_h=u3_cover_show_h; u3_cover_show_h=abs_h; u3_cover_show_e=abs_e; u3_cover_show_us=now; u3_cover_measure_rend(now,prev_h,abs_h); }
         u3_turn_pose(p,pivot,wrap_degrees(hp-abs_h),ef-abs_e);
+        u3_cover_floor(r14,p);
         return;
     }
     if (u3_cover_show_us && now-u3_cover_show_us<100000) {
@@ -4494,12 +4645,13 @@ static void u3_cover_layer(uint64_t r14) {
         if (SDL_fabsf(u3_cover_yaw)>3.0f && SDL_fabsf(wrap_degrees(hcq-u3_cover_show_h))<0.5f*SDL_fabsf(u3_cover_yaw)) u3_cover_yaw=wrap_degrees(hcq-u3_cover_show_h)+dyaw;
         if (SDL_fabsf(u3_cover_pitch)>3.0f && SDL_fabsf(ecq-u3_cover_show_e)<0.5f*SDL_fabsf(u3_cover_pitch)) u3_cover_pitch=(ecq-u3_cover_show_e)+dpitch;
     }
-    if (ef-u3_cover_pitch>80.0f) u3_cover_pitch=ef-80.0f;
+    if (ef-u3_cover_pitch>u3_cover_up_max()) u3_cover_pitch=ef-u3_cover_up_max();
     if (ef-u3_cover_pitch<-80.0f) u3_cover_pitch=ef+80.0f;
     { const float prev_h=u3_cover_show_h;
     u3_cover_show_h=wrap_degrees(hcq-u3_cover_yaw); u3_cover_show_e=ecq-u3_cover_pitch; u3_cover_show_us=now;
     u3_cover_measure_rend(now,prev_h,u3_cover_show_h); }
     u3_turn_pose(p,pivot,u3_cover_yaw,u3_cover_pitch);
+    u3_cover_floor(r14,p);
 }
 /* After the walking camera has taken over from the cover its position shown goes on by its own speed (measured: 18 degrees past the heading, then
  * back) and the picture jumped. For 0.35 s the picture goes on from the heading the cover showed, turned by the mouse (u3_tk_h, kept by
@@ -5185,7 +5337,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         quat_rotate(p+4,fwd,pf);
         const float hcq=SDL_atan2f(cf[0],cf[2])*57.29578f, ecq=SDL_asinf(cf[1]>1.0f ? 1.0f : cf[1]<-1.0f ? -1.0f : cf[1])*57.29578f;
         const float hp=SDL_atan2f(pf[0],pf[2])*57.29578f, ep=SDL_asinf(pf[1]>1.0f ? 1.0f : pf[1]<-1.0f ? -1.0f : pf[1])*57.29578f;
-        if (ecq-u3_cover_pitch>80.0f) u3_cover_pitch=ecq-80.0f;
+        if (ecq-u3_cover_pitch>u3_cover_up_max()) u3_cover_pitch=ecq-u3_cover_up_max();
         if (ecq-u3_cover_pitch<-80.0f) u3_cover_pitch=ecq+80.0f;
         const float hd=hcq-u3_cover_yaw, ed=ecq-u3_cover_pitch;
         u3_turn_pose(p,u3_cover_pivot,wrap_degrees(hp-hd),ep-ed);
