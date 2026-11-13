@@ -3707,6 +3707,9 @@ static float u3_dbg_dx, u3_dbg_dy;   /* the raw mouse pixels taken by the last u
 static float u3_head_base, u3_head_elev; static uint64_t u3_head_base_us, u3_head_act_us;   /* (BB_U3_HEAD11E0) the pose heading the game produced on the last aiming update, and when */
 static float u3_aim_e0, u3_aim_total_pitch;
 static float u3_aim_h0, u3_aim_total_yaw;  static int u3_aim_from_cover, u3_aim_h0_ok;   /* (tentative redefinitions: the definitions follow) */
+static uint64_t u3_swap_press_us;   /* (tentative redefinition: the definition follows) */
+static uint64_t u3_rebase_key;   /* (tentative redefinition: the definition follows) */
+static int u3_aim_cover_swap;   /* (BB_U3_HEADSWAP, 2026-11-13) the aim began in cover and a shoulder switch (REBASE) has cleared u3_aim_from_cover: the game's aim vector 0x11e0 stays driven (its wall collision keeps running at the mouse heading, as before the switch) */
 static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
     {   /* (test, BB_U3_HEAD11E0=1, 2026-11-12) the game's aim heading is the vector camera+0x11e0 (turned by the stick in 0x511370, read by 0x50bcb0 in this update):
@@ -3715,18 +3718,31 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
         static int hv=-1; if (hv<0) { const char *e=getenv("BB_U3_HEAD11E0"); hv=!(e && e[0]=='0'); }   /* BB_U3_HEAD11E0=0: off (the old behaviour: our rotation of the output pose only) */
         static float prev_target; static uint64_t prev_us;
         const uint64_t tn=now_us();
-        if (hv && aim_held && u3_aim_from_cover && u3_aim_h0_ok && camera) {
+        /* the shoulder switch: for ~0.4 s the new camera's pose is transient (measured 2026-11-13: heading -26, 0.6, 31, -50, 3.8 degrees in 0.3 s): the closed loop followed it and wrote 11e0 tilted 60 degrees up, the picture shook. No writes until it has settled (BB_U3_HEADSWAPWAIT=<ms>, default 700) */
+        static int sw_wait=-1; if (sw_wait<0) { const char *e=getenv("BB_U3_HEADSWAPWAIT"); sw_wait=e && e[0] ? atoi(e) : 700; }
+        int swap_quiet=(u3_aim_cover_swap || u3_aim_from_cover) && u3_swap_press_us && tn>=u3_swap_press_us && tn-u3_swap_press_us<(uint64_t)sw_wait*1000;
+        if (swap_quiet) {   /* (resume as soon as the pose heading the game produces holds still: 4 updates within 2 degrees of each other, 0.2 s after the press at the earliest; sw_wait is the ceiling. Nothing is written meanwhile, so the heading only moves by the game's own transient.) */
+            static uint64_t qkey; static float qb; static int qstable;
+            if (qkey!=u3_swap_press_us) { qkey=u3_swap_press_us; qb=u3_head_base; qstable=0; }
+            else { const float dq=wrap_degrees(u3_head_base-qb); qb=u3_head_base; if (dq<2.0f && dq>-2.0f) ++qstable; else qstable=0; }
+            if (tn-u3_swap_press_us>=200000 && qstable>=4) swap_quiet=0;
+            if (mouse_debug() && !swap_quiet) printf("Mouse: U3 HEADSWAP resumed %.0f ms after the press\n",(double)(tn-u3_swap_press_us)*1e-3);
+        }
+        { static uint64_t rk; if (rk!=u3_rebase_key) { rk=u3_rebase_key; prev_us=0; } }   /* (the rebase moves h0 and zeroes the total: the target jumps, that step is not the mouse's) */
+        /* (while quiet the loop is not closed on the pose, which is unreliable then, but the mouse's own turn still goes to 11e0 so the game's collision follows our heading: a first version wrote nothing, the mouse turned 125 degrees meanwhile and 131 degrees were written at once on resuming, 2026-11-13) */
+        if (hv && aim_held && (u3_aim_from_cover || u3_aim_cover_swap) && u3_aim_h0_ok && camera) {
             const float target=u3_aim_h0-u3_aim_total_yaw;
             u3_head_act_us=tn;
             float d=0.0f;
             static int closed=-1; if (closed<0) { const char *e=getenv("BB_U3_HEADCLOSED"); closed=!(e && e[0]=='0'); }   /* closed loop (default): turn 11e0 by the gap between the heading we want and the pose heading the game produced on the last update (the pose sits ~10 degrees off the direction), so u3_aim_out has nothing left to turn and the picture is the game's own pose, as with the pad. BB_U3_HEADCLOSED=0: turn by the mouse's delta only */
-            if (closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
+            const int use_closed=closed && !swap_quiet;
+            if (use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
             else if (prev_us && tn>prev_us && tn-prev_us<100000) d=wrap_degrees(target-prev_target);
             prev_target=target; prev_us=tn;
             float v[4];
             static int pitch_on=-1; if (pitch_on<0) { const char *e=getenv("BB_U3_HEADPITCH"); pitch_on=!(e && e[0]=='0'); }   /* the height too (11e0's y): the game's own pitch geometry, not our rotation of its pose. BB_U3_HEADPITCH=0: off */
             float de=0.0f;
-            if (pitch_on && closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) {
+            if (pitch_on && use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) {
                 float te=u3_aim_e0-u3_aim_total_pitch; if (te>75.0f) te=75.0f; if (te<-75.0f) te=-75.0f;
                 de=te-u3_head_elev;
             }
@@ -3980,7 +3996,7 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         const int gone_long=rc && !roll_cont && u3_aim_frame_us && now>u3_aim_frame_us && now-u3_aim_frame_us>100000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000);   /* (the camera was away over 0.1 s without a roll or a shoulder switch: grenade launcher, see above) */
         if (was_out || !u3_aim_active_us || gone_long || (now-u3_aim_active_us>300000 && !roll_cont)) {   /* (every new aim starts from the picture it finds, see u3_layer_blend: the total is not carried over a release) */
             u3_aim_total_yaw=u3_aim_total_pitch=0.0f;
-            u3_aim_from_cover=0; u3_aim_h0_ok=0; u3_aim_base_yaw=u3_aim_base_pitch=0.0f;
+            u3_aim_from_cover=0; u3_aim_cover_swap=0; u3_aim_h0_ok=0; u3_aim_base_yaw=u3_aim_base_pitch=0.0f;
             /* From cover: the aim starts from the cover camera's raw picture (u3_cover_layer stops turning it at the press), the mouse's turn since the
              * cover began is the aim's first turn, or the aim lands where the game's own cover direction points. */
             if (u3_cover_seen_us && now-u3_cover_seen_us<300000) { u3_aim_total_yaw=u3_cover_yaw; u3_aim_total_pitch=u3_cover_pitch; u3_aim_base_yaw=u3_cover_yaw; u3_aim_base_pitch=u3_cover_pitch; u3_aim_from_cover=1; }
@@ -4070,6 +4086,8 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
             if (mouse_debug()) printf("Mouse: U3 REBASE? T=%.4f raw=%.2f,%.2f shown=%.2f,%.2f total=%.2f,%.2f\n",now*1e-6,(double)rawh,(double)elevation,(double)u3_layer_heading,(double)u3_layer_elev,(double)u3_aim_total_yaw,(double)u3_aim_total_pitch);
             if (SDL_fabsf(dh)<25.0f && SDL_fabsf(de)<8.0f) {
                 u3_rebase_key=u3_swap_press_us;
+                static int hs=-1; if (hs<0) { const char *e=getenv("BB_U3_HEADSWAP"); hs=!(e && e[0]=='0'); }   /* BB_U3_HEADSWAP=0: off (the aim born in cover goes back to the plain aim after a shoulder switch) */
+                if (hs && u3_aim_from_cover) u3_aim_cover_swap=1;
                 u3_aim_total_yaw=u3_aim_total_pitch=0.0f; u3_aim_from_cover=0; u3_aim_base_yaw=u3_aim_base_pitch=0.0f;
                 u3_rebase_h=rawh; u3_rebase_e=elevation; u3_rebase_pending=1;
                 if (mouse_debug()) printf("Mouse: U3 REBASE done\n");
@@ -4256,7 +4274,7 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
     float yaw_use=*total_yaw;
     float pitch_use=*total_pitch;
     if (mouse_debug() && !blending_out) { static uint64_t pu; if (was_out || now-pu>500000) { pu=now; printf("Mouse: U3 AIMOUT T=%.4f cam_e=%.2f total_pitch=%.2f e0=%.2f ok=%d from_cover=%d\n",now*1e-6,(double)elevation,(double)*total_pitch,(double)u3_aim_e0,u3_aim_h0_ok,u3_aim_from_cover); } }
-    if (!blending_out && u3_aim_from_cover && u3_aim_h0_ok) {   /* absolute, as u3_layer_blend did during the fade-in: heading = h0 - total */
+    if (!blending_out && (u3_aim_from_cover || u3_aim_cover_swap) && u3_aim_h0_ok) {   /* absolute, as u3_layer_blend did during the fade-in: heading = h0 - total */
         if (u3_aim_e0-*total_pitch>80.0f) *total_pitch=u3_aim_e0-80.0f;
         if (u3_aim_e0-*total_pitch<-80.0f) *total_pitch=u3_aim_e0+80.0f;
         yaw_use=wrap_degrees(base_heading-(u3_aim_h0-*total_yaw));
@@ -4274,7 +4292,7 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         static int ch=-1; if (ch<0) { const char *e=getenv("BB_U3_CHASE"); ch=!(e && e[0]=='0'); }   /* BB_U3_CHASE=0: off (the old behaviour: the game's heading stays put, the camera against a wall keeps the distance of the untouched heading) */
         static int chase_turret=-1; if (chase_turret<0) { const char *e=getenv("BB_U3_CHASETURRET"); chase_turret=!(e && e[0]=='0'); }   /* turret: Drake/the turret follow the game's heading, not ours (2026-11-11 FP log: the final pose orbits the same centre as with the pad). BB_U3_CHASETURRET=0: off */
         static int chase_cover=-1; if (chase_cover<0) { const char *e=getenv("BB_U3_CHASECOVER"); chase_cover=(e && e[0]=='1'); }   /* BB_U3_CHASECOVER=1 (test, 2026-11-12): also follow the heading by the stick when the aim began in cover (the wall behind Drake pulls the camera in at the game's heading) */
-        const int allowed=ch && !blending_out && (!u3_aim_from_cover || chase_cover) && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000 && !chase_turret) &&
+        const int allowed=ch && !blending_out && ((!u3_aim_from_cover && !u3_aim_cover_swap) || chase_cover) && !hold_fresh && !(u3_turret_us && now-u3_turret_us<100000 && !chase_turret) &&
                           !(u3_swap_press_us && now-u3_swap_press_us<1500000) && !(u3_roll_press_us && now-u3_roll_press_us<2000000);
         if (allowed) {
             if (was_out || !u3_chase_ok) { u3_chase_ref=base_heading+*total_yaw; u3_chase_ok=1; }
