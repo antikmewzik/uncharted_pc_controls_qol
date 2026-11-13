@@ -3792,6 +3792,8 @@ static float u3_aim_pivot[3];   /* the player's pivot, as worked out from the ai
 static float u3_anim_h;   /* U3: the heading the ledge / climb camera's layer left the picture at (degrees), handed to the walking camera when it comes back */
 static uint64_t u3_anim_layer_us;   /* U3: when the ledge / climb camera's layer last held the picture (the walking camera's update, which runs on, leaves the mouse to it) */
 static uint64_t u3_walk_update_us;   /* U3: when the walking camera's update last ran (it stops while a scripted camera, e.g. following Sully in chapter 2, holds the picture) */
+static uint64_t u3_scriptlook_us;   /* the game's "look there" camera (+0x16b5160) was shown at this time: the mouse leaves everything alone */
+static float u3_walk_arc_last=-9.0f;   /* (diagnostic) the walking camera's arc +0x7874 as of its last update, printed at the start of V to compare pad and mouse limits */
 static float u3_walk_pivot_last[3]; static int u3_walk_pivot_ok;   /* the walking camera's pivot (+0x78a0) as of its last update: the player's, the V view turns about it */
 static float u3_aim_drake_off[2];   /* U3 aim: horizontal (x, z) gap from the pivot worked out from the aiming output to the player (the game turns its aim about the player: measured 2026-11-09, 0.42 m off with the fixed shoulder offset, the camera-to-player distance then varied 0.66-1.54 m), added to the pivot at each new aim; zeroed by a shoulder switch (its calibration puts the pivot where it was) */
 static float u3_dbg_walk_pivot[3]; static uint64_t u3_dbg_walk_us;   /* (diagnostic) the walking camera's pivot at its last update, read in u3_walk_camera */
@@ -4428,6 +4430,7 @@ static int u3_turn_pose_world(float *p, const float *pivot, float yaw, float pit
  * pose is then kept by the layer stack), so the mouse turns the final pose at the layer hook, like the cover: the total turn since V began is applied to
  * the pose the game gives each frame (yaw about the world up, pitch about the pose's side), about the pose's own position (the view stays at the head).
  * The mouse is taken natively (queue 2, fed while R3 is held and for ~1.3 s after), so it no longer goes through the emulated stick. */
+static int u3_player_feet(uint64_t cam, float *out3);
 static void u3_look_layer(uint64_t r14, uint64_t image) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -4441,25 +4444,59 @@ static void u3_look_layer(uint64_t r14, uint64_t image) {
     if ((uintptr_t)p<0x10000) return;
     const float len2=p[4]*p[4]+p[5]*p[5]+p[6]*p[6]+p[7]*p[7];
     if (!(len2>0.98f && len2<1.02f && p[0]>-100000.0f && p[0]<100000.0f && p[1]>-100000.0f && p[1]<100000.0f && p[2]>-100000.0f && p[2]<100000.0f)) return;
-    if (now-last_us>300000) { total_yaw=total_pitch=0.0f; turn.pending_yaw=turn.pending_pitch=0.0f; frame_us=0; }   /* a new V: the turn starts again */
+    static int dump_pending, v_known, v_forced;
+    if (now-last_us>300000) { total_yaw=total_pitch=0.0f; turn.pending_yaw=turn.pending_pitch=0.0f; frame_us=0; dump_pending=1; v_known=v_forced=0; }   /* a new V: the turn starts again */
+    /* (2026-11-13) a V the game forces ("press V to look at the window": the pad does not move it): measured on the camera object, three pointer fields (+0x258, +0x280, +0x2a8) are 0 where a free V has
+     * them set. The mouse then leaves the pose alone, as the pad's stick does. BB_U3_VFORCED=0: off */
+    if (!v_known && w>0.99f) {
+        static int vfo=-1; if (vfo<0) { const char *e=getenv("BB_U3_VFORCED"); vfo=!(e && e[0]=='0'); }
+        uint64_t a=1, b=1, c=1;
+        if (safe_read(&a,r14+0x258,8) && safe_read(&b,r14+0x280,8) && safe_read(&c,r14+0x2a8,8)) { v_known=1; v_forced=vfo && a==0 && b==0 && c==0; if (mouse_debug()) printf("Mouse: U3 V forced=%d (%llx %llx %llx)\n",v_forced,(unsigned long long)a,(unsigned long long)b,(unsigned long long)c); }
+    }
+    if (dump_pending && w>0.99f && mouse_debug()) {   /* (diagnostic 2026-11-13: the V camera object at the start of each V, to tell a V the game forces (hint: "press V to look at the window") from a free one) */
+        dump_pending=0;
+        static unsigned vn; ++vn;
+        static uint32_t d[0x600/4];
+        if (safe_read(d,r14,sizeof d)) for (int i=0;i<0x600/4;i+=8) printf("Mouse: VDUMP n=%u +%03x %08x %08x %08x %08x %08x %08x %08x %08x\n",vn,i*4,d[i],d[i+1],d[i+2],d[i+3],d[i+4],d[i+5],d[i+6],d[i+7]);
+    }
     last_us=now;
     u2_native_us=now;
+    if (v_forced) { float ix, iy; camera_take(2,&ix,&iy); camera_take(0,&ix,&iy); return; }
     if (!(frame_us && now-frame_us<1500)) {   /* (the layer can be called twice in one frame: the mouse is taken once) */
         float step, step_pitch;
         if (u2_mouse_turn(&turn,2,r14,u2_frame_dt(image),input.mouse_aim_sensitivity,-1.0f,&step,&step_pitch)) {
             total_yaw+=step; total_pitch+=step_pitch;
-            total_pitch=total_pitch<-75.0f ? -75.0f : total_pitch>75.0f ? 75.0f : total_pitch;
+            /* (2026-11-13: the pad stops at an ABSOLUTE elevation of ±75 degrees (measured, 360-degree sweep); the mouse's ±75 was counted from the pose the V view starts at (a few degrees up),
+             * so it stopped earlier downwards. BB_U3_VABS=0: the old limit) */
+            static int va=-1; if (va<0) { const char *e=getenv("BB_U3_VABS"); va=!(e && e[0]=='0'); }
+            float lo=-75.0f, hi=75.0f;
+            if (va) { const float fz[3]={0.0f,0.0f,1.0f}; float f0[3]; quat_rotate(p+4,fz,f0); const float e0=SDL_asinf(f0[1]>1.0f ? 1.0f : f0[1]<-1.0f ? -1.0f : f0[1])*57.29578f; lo=e0-75.0f; hi=e0+75.0f; }   /* (a positive pitch looks DOWN: elevation = e0 - pitch) */
+            total_pitch=total_pitch<lo ? lo : total_pitch>hi ? hi : total_pitch;
         }
         frame_us=now;
     }
     /* The view goes round the player (it stays behind his back), about the walking camera's pivot; without a sane one, about its own position */
-    float pivot[3]={p[0],p[1],p[2]};
+    float pivot[3]={p[0],p[1],p[2]}, cen[3]={p[0],p[1],p[2]}; int split=0;
     if (u3_walk_pivot_ok) {
         const float dx=u3_walk_pivot_last[0]-p[0], dy=u3_walk_pivot_last[1]-p[1], dz=u3_walk_pivot_last[2]-p[2], d2=dx*dx+dy*dy+dz*dz;
         if (d2>0.01f && d2<100.0f) { pivot[0]=u3_walk_pivot_last[0]; pivot[1]=u3_walk_pivot_last[1]; pivot[2]=u3_walk_pivot_last[2]; }
     }
+    /* (measured 2026-11-12, pad vs mouse on the same V: the game orbits a centre 2.06 m straight ahead of the pose it gives (sphere fit, spread 0.1 m over a full sweep); the walking camera's pivot is
+     * ~2 m lower and 0.7 m aside, so the mouse view went under the floor / lost the player. BB_U3_VPIVOT=0: the old pivot; BB_U3_VRADIUS=<m>) */
+    { static int vp=-1; static float vr=2.06f;
+      if (vp<0) { const char *e=getenv("BB_U3_VPIVOT"); vp=!(e && e[0]=='0'); const char *r=getenv("BB_U3_VRADIUS"); if (r && r[0]) vr=(float)atof(r); }
+      if (vp) { const float fwd[3]={0.0f,0.0f,1.0f}; float f[3]; quat_rotate(p+4,fwd,f); for (int i=0;i<3;++i) pivot[i]=p[i]+vr*f[i]; }
+      /* (2026-11-13: with the pad Drake stays put on the screen, with the mouse he swept across it: the centre 2.06 m ahead of the pose is ~0.7 m beside him; the yaw goes round the vertical through the player (A+0x4d0).
+       * BB_U3_VFEET=0: back to the centre ahead) */
+      static int vf=-1; if (vf<0) { const char *e=getenv("BB_U3_VFEET"); vf=!(e && e[0]=='0'); }
+      for (int i=0;i<3;++i) cen[i]=pivot[i];
+      float ft[3]; if (vp && vf && u3_player_feet(r14,ft)) { pivot[0]=ft[0]; pivot[2]=ft[2]; split=1; } }
     if (mouse_debug()) { static unsigned n; if ((n++&15)==0) printf("Mouse: U3 V view turn yaw=%.2f pitch=%.2f w=%.3f pivot=(%.2f %.2f %.2f)\n",(double)total_yaw,(double)total_pitch,(double)w,(double)pivot[0],(double)pivot[1],(double)pivot[2]); }
-    u3_turn_pose(p,pivot,total_yaw,total_pitch);
+    /* (2026-11-13, pad vs mouse on the same sweep: with the pad the pitch goes round the game's centre (looking up, the camera ends 0.5 m from the player, he looms; round the player's axis it was 1.1 m and he sank to the
+     * screen's bottom). So: pitch about the game's centre, then the yaw about the player's vertical, which keeps him still on the screen. BB_U3_VSPLIT=0: both about the player's axis) */
+    static int sp=-1; if (sp<0) { const char *e=getenv("BB_U3_VSPLIT"); sp=!(e && e[0]=='0'); }
+    if (split && sp) { u3_turn_pose(p,cen,0.0f,total_pitch); u3_turn_pose(p,pivot,total_yaw,0.0f); }
+    else u3_turn_pose(p,pivot,total_yaw,total_pitch);
 }
 /* (diagnostic, BB_MOUSE_DEBUG=1) why the cover layer let the picture go untouched this frame; one line per reason per 100 ms */
 static void u3_cover_skip(int why, float a, float b) {
@@ -5008,12 +5045,16 @@ static void __attribute__((ms_abi)) u3_layer_blend(uint64_t rdi, uint64_t rsi, u
     if (!mouse_debug()) return;
     static int fp=-1; if (fp<0) { const char *e=getenv("BB_U3_FINALPOSE"); fp=(e && e[0]=='1'); }
     const uint64_t tn=now_us();
-    if (!fp || !r14 || !(aim_held || (u3_aim_active_us && tn-u3_aim_active_us<2500000))) return;
+    if (!fp || !r14) return;
     const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
     const float *p=(const float *)(uintptr_t)g->rax;
     uint64_t vt=0; float w=0.0f;
     if ((uintptr_t)p<0x10000 || !safe_read(&vt,r14,8) || !safe_read(&w,r14+0x108,4)) return;
+    /* (the V view's layer is traced too, pad or mouse, to compare the two orbits) */
+    if (!(aim_held || (u3_aim_active_us && tn-u3_aim_active_us<2500000) || ((vt==runtime_image_base()+0x1671c30 || vt==runtime_image_base()+0x16b5160) && w>0.0005f))) return;
     const float fwd[3]={0.0f,0.0f,1.0f}; float f[3]; quat_rotate(p+4,fwd,f);
+    if (vt==runtime_image_base()+0x16b5160) { static uint64_t rq; if (tn-rq>100000) { rq=tn; float ry=0.0f; double ra=0.0; const int rok=bbgpu_camera_yaw(&ry,&ra); printf("Mouse: SLOOK T=%.4f w=%.3f layer_h=%.2f rendered=%.2f ok=%d age=%.3f\n",tn*1e-6,(double)w,(double)(SDL_atan2f(f[0],f[2])*57.29578f),rok ? (double)ry : 0.0,rok,ra); } }
+    if (vt==runtime_image_base()+0x1671c30) { static uint64_t fq; if (tn-fq>200000) { fq=tn; float ft[3]; const int ok=u3_player_feet(r14,ft); printf("Mouse: VFEET ok=%d feet=%.3f,%.3f,%.3f walkarc=%.4f\n",ok,ok?(double)ft[0]:0.0,ok?(double)ft[1]:0.0,ok?(double)ft[2]:0.0,(double)u3_walk_arc_last); } }
     printf("Mouse: FP T=%.4f cls=%#llx w=%.3f pos=%.3f,%.3f,%.3f h=%.2f e=%.2f\n",tn*1e-6,(unsigned long long)(vt-runtime_image_base()),(double)w,(double)p[0],(double)p[1],(double)p[2],(double)(SDL_atan2f(f[0],f[2])*57.29578f),(double)(SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f));
 }
 static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
@@ -5035,6 +5076,17 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         last_us=t;
         uint64_t vt=0; float w=0.0f;
         if (n_cur<8 && safe_read(&vt,r14,8)) { safe_read(&w,r14+0x108,4); cur[n_cur]=vt-runtime_image_base(); cw[n_cur]=w; ++n_cur; }
+    }
+    if (r14) {   /* (2026-11-13) the game's "look there" camera (V pressed when the game asks for it: a window, an objective): class +0x16b5160. The pad does not move it, so the mouse must not either: the layers
+                  * are left alone, the queues are emptied and the emulated stick is not fed while it is shown. BB_U3_SCRIPTLOOK=0: off) */
+        static int sl_on=-1; if (sl_on<0) { const char *e=getenv("BB_U3_SCRIPTLOOK"); sl_on=!(e && e[0]=='0'); }
+        uint64_t svt=0; float sw=0.0f; const uint64_t sn=now_us();
+        if (sl_on && safe_read(&svt,r14,8) && svt==runtime_image_base()+0x16b5160 && safe_read(&sw,r14+0x108,4) && sw>0.005f) u3_scriptlook_us=sn;
+        if (sl_on && u3_scriptlook_us && sn-u3_scriptlook_us<400000) {
+            float ix, iy; camera_take(0,&ix,&iy); camera_take(2,&ix,&iy);
+            u2_native_us=sn;
+            return;
+        }
     }
     if (r14) {   /* U3 turret: the aiming-class layer (+0x16736f0) at full weight with L2 up for 0.3 s: the game aims without L2, the mouse must stay native (u3_turret_us counts as aim_held).
                   * Once detected it holds while the layer stays shown, L2 or not (measured 2026-11-03: the turret camera orbits a pivot 2.33 m straight ahead, no lateral offset) */
@@ -5583,6 +5635,7 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
         }
     }
     if (disabled || pad_only_mode) return;
+    { float av; if (safe_read(&av,camera+0x7874,4) && av==av && av>-2.0f && av<3.0f) u3_walk_arc_last=av; }
     { float pv[3]; if (safe_read(pv,camera+0x78a0,12) && (pv[0]!=0.0f || pv[1]!=0.0f || pv[2]!=0.0f) && pv[0]>-100000.0f && pv[0]<100000.0f && pv[1]>-100000.0f && pv[1]<100000.0f && pv[2]>-100000.0f && pv[2]<100000.0f) { u3_walk_pivot_last[0]=pv[0]; u3_walk_pivot_last[1]=pv[1]; u3_walk_pivot_last[2]=pv[2]; u3_walk_pivot_ok=1; } }   /* (the V view replaces the walking camera and its object is zeroed: its last pivot is kept) */
     const uint64_t now=now_us();
     u3_walk_update_us=now;
@@ -5625,6 +5678,7 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     }
     if (mouse_debug() && !(aim_held && u3_aim_seen_us && now-u3_aim_seen_us<150000)) { float wp[3]; if (safe_read(wp,camera+0x78a0,12)) { for (int i=0;i<3;++i) u3_dbg_walk_pivot[i]=wp[i]; u3_dbg_walk_us=now; } }
     if (aim_held && u3_aim_seen_us && now-u3_aim_seen_us<150000) return;
+    if (u3_scriptlook_us && now-u3_scriptlook_us<400000) { float ix, iy; camera_take(0,&ix,&iy); return; }   /* (the game's "look there" camera: the walking cameras under it stay as the game has them) */
     {   /* Grenade launcher: the aiming camera is gone 0.15 s but the aim is still "held" (the throw fade, up to ~0.75 s after the release). The walking camera must not take the mouse yet: queue 0 held the turns of the whole aim, which came out as one 27 degree turn of the walking camera at this frame (measured on the final pose 2026-11-08: a jump of ~1 m 0.6 s after the throw, undone ~0.2 s later by the pin). The queue is emptied instead. BB_U3_GONEDRAIN=0: off */
         static int gd=-1; if (gd<0) { const char *e=getenv("BB_U3_GONEDRAIN"); gd=!(e && e[0]=='0'); }
         if (gd && aim_held && !l2_held && u3_aim_active_us && now-u3_aim_active_us<2000000) { float ix, iy; camera_take(0,&ix,&iy); return; }
