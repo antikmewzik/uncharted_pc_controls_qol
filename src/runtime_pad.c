@@ -3710,6 +3710,9 @@ static float u3_aim_h0, u3_aim_total_yaw;  static int u3_aim_from_cover, u3_aim_
 static uint64_t u3_swap_press_us;   /* (tentative redefinition: the definition follows) */
 static uint64_t u3_rebase_key;   /* (tentative redefinition: the definition follows) */
 static int u3_aim_cover_swap;   /* (BB_U3_HEADSWAP, 2026-11-13) the aim began in cover and a shoulder switch (REBASE) has cleared u3_aim_from_cover: the game's aim vector 0x11e0 stays driven (its wall collision keeps running at the mouse heading, as before the switch) */
+static uint64_t u3_reload_us, u3_reload_raw_us, u3_reload_real_us; static float u3_reload_raw_h;   /* (u3_reload_real_us: the aiming camera really was away -- stale for 25 ms or more -- while the cover camera showed alone; u3_reload_us is also kept fresh all through any aim begun in a cover) */   /* (reload in a cover with the aim held: last frame of it, and the game's RAW heading of the cover camera then = the direction Drake faces) */
+#define reload_us u3_reload_us
+static float u3_aim_fin[7]; static uint64_t u3_aim_fin_us;   /* (the aiming camera's final pose: position, quaternion; and when) */
 static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
     {   /* (test, BB_U3_HEAD11E0=1, 2026-11-12) the game's aim heading is the vector camera+0x11e0 (turned by the stick in 0x511370, read by 0x50bcb0 in this update):
@@ -3734,6 +3737,37 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
             const float target=u3_aim_h0-u3_aim_total_yaw;
             u3_head_act_us=tn;
             float d=0.0f;
+            /* The aiming camera that comes back after a reload in a cover copies the picture we showed (turned by the mouse, up to ~100 degrees off) into its aim vector 0x11e0, and the game turns Drake's body to it in one frame: the "pop" seen in the clip 2026-11-14 (size follows the turn made during the reload: 56 -> 7.9, 60 -> 11.1, 106 -> 16.0). The pad cannot turn the view that far from Drake, so the game never meets it. The vector starts from the heading the game itself had (the cover camera's raw heading) and goes to the picture's at BB_U3_HEADRATE degrees a second (default 300): Drake turns instead of popping, the picture stays 1:1 (it is absolute). BB_U3_HEADSMOOTH=0: off */
+            int sm_handled=0;
+            {
+                static int smooth=-1; if (smooth<0) { const char *e=getenv("BB_U3_HEADSMOOTH"); smooth=(e && e[0]=='1'); }   /* OFF by default since 2026-11-14: tested in play, the pop is unchanged (the camera itself steps, see the clip analysis); BB_U3_HEADSMOOTH=1 to test */
+                static float rate=-1.0f; if (rate<0.0f) { const char *e=getenv("BB_U3_HEADRATE"); rate=e && e[0] ? (float)atof(e) : 300.0f; }
+                static uint64_t sm_cam, sm_us; static int sm_on; static float sm_h;
+                if (smooth) {
+                    if (camera!=sm_cam) {
+                        sm_cam=camera; sm_on=0;
+                        if (u3_reload_real_us && tn>=u3_reload_real_us && tn-u3_reload_real_us<800000 && u3_reload_raw_us && tn>=u3_reload_raw_us && tn-u3_reload_raw_us<800000) {
+                            sm_on=1; sm_h=u3_reload_raw_h; sm_us=0;
+                            if (mouse_debug()) printf("Mouse: U3 HEADSMOOTH start T=%.4f from %.2f to %.2f\n",tn*1e-6,(double)sm_h,(double)target);
+                        }
+                    }
+                    if (sm_on) {
+                        float dt=(sm_us && tn>sm_us) ? (float)(tn-sm_us)*1e-6f : 0.0f; sm_us=tn; if (dt>0.1f) dt=0.1f;
+                        float dd=wrap_degrees(target-sm_h); const float step=rate*dt;
+                        if (dd>step) dd=step; if (dd<-step) dd=-step;
+                        sm_h=wrap_degrees(sm_h+dd);
+                        float v2[4];
+                        if (safe_read(v2,camera+0x11e0,16) && (v2[0]*v2[0]+v2[2]*v2[2])>0.0001f) {
+                            const float hl=SDL_sqrtf(v2[0]*v2[0]+v2[2]*v2[2]), r=sm_h*0.017453293f;
+                            v2[0]=hl*SDL_sinf(r); v2[2]=hl*SDL_cosf(r);
+                            safe_write(camera+0x11e0,v2,16);
+                        }
+                        sm_handled=1;
+                        if (mouse_debug()) printf("Mouse: U3 HEADSMOOTH T=%.4f cmd=%.2f target=%.2f\n",tn*1e-6,(double)sm_h,(double)target);
+                        if (SDL_fabsf(wrap_degrees(target-sm_h))<0.5f) sm_on=0;
+                    }
+                }
+            }
             static int closed=-1; if (closed<0) { const char *e=getenv("BB_U3_HEADCLOSED"); closed=!(e && e[0]=='0'); }   /* closed loop (default): turn 11e0 by the gap between the heading we want and the pose heading the game produced on the last update (the pose sits ~10 degrees off the direction), so u3_aim_out has nothing left to turn and the picture is the game's own pose, as with the pad. BB_U3_HEADCLOSED=0: turn by the mouse's delta only */
             const int use_closed=closed && !swap_quiet;
             if (use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
@@ -3746,7 +3780,7 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
                 float te=u3_aim_e0-u3_aim_total_pitch; if (te>75.0f) te=75.0f; if (te<-75.0f) te=-75.0f;
                 de=te-u3_head_elev;
             }
-            if ((d!=0.0f || de!=0.0f) && safe_read(v,camera+0x11e0,16) && (v[0]*v[0]+v[2]*v[2])>0.0001f) {
+            if (!sm_handled && (d!=0.0f || de!=0.0f) && safe_read(v,camera+0x11e0,16) && (v[0]*v[0]+v[2]*v[2])>0.0001f) {
                 const float r=d*0.017453293f, c=SDL_cosf(r), s=SDL_sinf(r);
                 float x=v[0]*c+v[2]*s, z=v[2]*c-v[0]*s;
                 if (de!=0.0f) {
@@ -4146,7 +4180,7 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         if (fresh) seen[k].first=now;
         seen[k].last=now;
         static uint64_t aim_began; if (was_out) aim_began=now;
-        if (fh && !blending_out && !was_out && seen[k].first>aim_began+100000 && now-seen[k].first<500000 && u3_aim_active_us && now-u3_aim_active_us<300000 && u3_aim_frame_us && now-u3_aim_frame_us<300000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+        if (fh && !blending_out && !was_out && !u3_aim_from_cover && seen[k].first>aim_began+100000 && now-seen[k].first<500000 && u3_aim_active_us && now-u3_aim_active_us<300000 && u3_aim_frame_us && now-u3_aim_frame_us<300000 && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
             for (int i=0;i<3;++i) pivot[i]=u3_aim_pivot[i];
             hold_fresh=1;   /* (its raw position is the old output, already turned, with the new base's heading: turning it again threw it to the other side of the player, 0.4 + 0.9 m in two frames, measured: the weapon's own shoulder offset is used instead) */
             if (mouse_debug()) { static uint64_t pu; if (now-pu>100000) { pu=now; printf("Mouse: U3 FRESHHOLD T=%.4f cam=%llx age=%.0fms pivot kept\n",now*1e-6,(unsigned long long)r14,(double)(now-seen[k].first)*1e-3); } }
@@ -5288,7 +5322,28 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
     }
     if (r14 && r14!=u3_cover_cam && u3_cover_seen_us && !aim_held && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us)) u3_relais_hold(r14);
     /* (the game reuses addresses: the aiming camera can sit where a cover camera was: it is the cover's layer only while the cover is recent) */
-    if (r14 && r14==u3_cover_cam && (r14!=u3_probe_aim_cam || (u3_cover_seen_us && now_us()-u3_cover_seen_us<400000))) {
+    /* Reload with the aim held in a cover (measured 2026-11-14): the aiming camera is gone, the cover camera shows alone at w=1 (a new object every ~0.3 s) and, the aim being "held", u3_cover_layer
+     * returned without turning it: the mouse did nothing. It goes to the held-aim branch below (mouse taken once a frame, absolute heading). BB_U3_COVERRELOAD=0: off */
+    static int crl=-1; if (crl<0) { const char *e=getenv("BB_U3_COVERRELOAD"); crl=!(e && e[0]=='0'); }
+    /* (2026-11-14, second measure: the cover camera also fades IN over the aiming camera at the start of the reload (w 0 -> 1 in 0.2 s, aim camera still running) and the aiming camera fades in OVER it when the reload ends (~0.3 s): the cover layer under was raw (28 degrees off the picture) and swung the picture both times. It stays turned for 0.6 s after the last reload frame / rising weight.) */
+    static float cw_prev; static uint64_t cw_prev_us;
+    int cover_reload=0;
+    /* (fourth measure: on the frame the aiming camera comes back the new-aim reset has just cleared u3_aim_h0_ok, and the cover layer showed its RAW pose for that one frame at w=1 (166 against 111 shown, position 2 m away): h0_ok is not required here, the last picture shown (u3_aim_last_heading) is still the right one) */
+    if (crl && r14 && r14==u3_cover_cam && aim_held && !l1_held && u3_aim_active_us && (u3_aim_h0_ok || (reload_us && now_us()-reload_us<1500000))) {
+        const uint64_t tn=now_us();
+        const float cw=*(const float *)(uintptr_t)(r14+0x108);
+        if (cw>0.002f) {
+            if (tn-u3_aim_active_us>30000 && tn-u3_aim_active_us<2500000 && u3_aim_frame_us && tn-u3_aim_frame_us>=25000) { reload_us=tn; u3_reload_real_us=tn; }
+            else if (u3_aim_frame_us && tn-u3_aim_frame_us>=25000 && tn-u3_aim_frame_us<3000000 && u3_aim_from_cover) u3_reload_real_us=tn;   /* (after a long aim the 2.5 s window above is shut) */
+            else if (cw<0.999f && cw>cw_prev+0.0005f && cw_prev_us && tn-cw_prev_us<100000 && tn-u3_aim_active_us>30000) reload_us=tn;
+            if (reload_us && tn>=reload_us && tn-reload_us<600000) cover_reload=1;
+            /* (third measure, 2026-11-14: a short reload, aiming camera never stale for 25 ms and the cover weight already 1: the cover layer at w=1 showed its raw pose (93 against 121 shown) and the picture followed it.
+             * Whenever the aim was begun in a cover and the cover camera is in the stack, it carries the picture shown.) */
+            if (u3_aim_from_cover) { cover_reload=1; reload_us=tn; }   /* (sixth measure: after a long aim the 2.5 s window above never opened, so on the frame the new aim reset h0_ok the cover layer showed its raw pose: this keeps the window open all through an aim begun in a cover) */
+        }
+        cw_prev=cw; cw_prev_us=tn;
+    }
+    if (r14 && r14==u3_cover_cam && !cover_reload && (r14!=u3_probe_aim_cam || (u3_cover_seen_us && now_us()-u3_cover_seen_us<400000))) {
         if (mouse_debug() && !aim_held && u3_cover_seen_us && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<2000000) {   /* (trace: the cover camera's layer after its update stopped, i.e. during the fade out) */
             const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
             const float *p=(const float *)(uintptr_t)g->rax, w=*(const float *)(uintptr_t)(r14+0x108);
@@ -5298,6 +5353,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
                 printf("Mouse: U3 cover FADE T=%.4f pos=%.3f,%.3f,%.3f age=%.0fms w=%.3f cover_h=%.2f final_h=%.2f final_e=%.2f\n",now_us()*1e-6,(double)p[0],(double)p[1],(double)p[2],(double)((now_us()-u3_cover_seen_us)*1e-3),(double)w,(double)(SDL_atan2f(cf[0],cf[2])*57.29578f),(double)(SDL_atan2f(pf[0],pf[2])*57.29578f),(double)(SDL_asinf(pf[1]>1.0f ? 1.0f : pf[1]<-1.0f ? -1.0f : pf[1])*57.29578f));
             }
         }
+        if (mouse_debug() && aim_held) { static uint64_t cvl; if (now_us()-cvl>50000) { cvl=now_us(); printf("Mouse: U3 COVERHELD T=%.4f cam=%llx w=%.3f seen_ms=%.0f aim_cam=%llx gone_ms=%.0f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)(u3_cover_seen_us ? (now_us()-u3_cover_seen_us)*1e-3 : -1.0),(unsigned long long)u3_probe_aim_cam,(double)(u3_aim_frame_us ? (now_us()-u3_aim_frame_us)*1e-3 : -1.0)); } }
         if (u3_tk_key && u3_tk_key==u3_cover_seen_us && !aim_held && now_us()-u3_cover_seen_us>=60000) { u3_cover_exit_layer(r14); u3_relais_hold(r14); return; }
         if (!aim_held && u3_tk_key!=u3_cover_seen_us && (u3_exit_test()&2) && !(u3_exit_test()&1) && !(u3_aim_active_us && u3_aim_active_us>u3_cover_show_us) && now_us()-u3_cover_seen_us>=100000 && now_us()-u3_cover_seen_us<400000) { u3_cover_hold(r14); u3_relais_hold(r14); return; }
         u3_cover_layer(r14); if (!aim_held) u3_relais_hold(r14); return;   /* (the cover's layer is the one on top: a hold written under it is overwritten) */
@@ -5352,7 +5408,8 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         uint64_t ovt=0;
         if (oa && r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_h0_ok && u3_layer_us && now_us()>u3_layer_us && now_us()-u3_layer_us<200000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000) && safe_read(&ovt,r14,8) && ovt==runtime_image_base()+0x16736f0) aim_other=1;
     }
-    if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && u3_aim_h0_ok && (aim_other || (now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
+    const int rmode=cover_reload || (u3_aim_from_cover && aim_held && reload_us && now_us()>=reload_us && now_us()-reload_us<1500000);   /* (the other layers of the stack too: the proxy cover-class layers and the walking layer) */
+    if (r14 && r14!=u3_probe_aim_cam && aim_held && u3_aim_active_us && (u3_aim_h0_ok || rmode) && (aim_other || rmode || (now_us()-u3_aim_active_us>30000 && now_us()-u3_aim_active_us<2000000) || (u3_roll_press_us && now_us()-u3_roll_press_us<1200000) || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000))) {
         const int swap_only=aim_other || (u3_swap_press_us && now_us()-u3_swap_press_us<1500000 && !(u3_roll_press_us && now_us()-u3_roll_press_us<2000000));
         if (swap_only && !(u3_layer_us && now_us()-u3_layer_us<200000)) return;
         if (!swap_only) u3_roll_us=now_us();
@@ -5380,18 +5437,53 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
                 quat_rotate(p+4,fwd,f);
                 const float hp=SDL_atan2f(f[0],f[2])*57.29578f, ep=SDL_asinf(f[1]>1.0f ? 1.0f : f[1]<-1.0f ? -1.0f : f[1])*57.29578f;
                 float own[3]={p[0],p[1],p[2]};   /* (no pivot known yet: the camera turns on the spot) */
+                if (rmode && !swap_only && r14==u3_cover_cam) { u3_reload_raw_h=hp; u3_reload_raw_us=now_us(); }   /* (the cover camera's raw heading, before our turn: the direction Drake faces, see u3_aim_camera_seen) */
                 if (swap_only) { for (int i=0;i<3;++i) own[i]=u3_aim_pivot[i]; }   /* (the shoulder switch: the player stays where he is, the camera turns about him) */
                 else {
                     static int gp=-1; if (gp<0) { const char *e=getenv("BB_U3_GONEPIVOT"); gp=!(e && e[0]=='0'); }
                     /* the grenade launcher (no roll): the same pivot as the throw fade and the pin (the player's pivot of the aim), or the position shifts by ~1 m each time the pivot changes (measured 2026-11-08 on the final pose: 0.8 m at the gone frame, 1.4 m back at the release). BB_U3_GONEPIVOT=0: the roll pivot as before */
-                    if (gp && !(u3_roll_press_us && now_us()-u3_roll_press_us<1500000)) { own[0]=u3_aim_pivot[0]; own[1]=u3_aim_pivot[1]; own[2]=u3_aim_pivot[2]; }
+                    uint64_t cvt2=0;
+                    const int use_cp=crl && u3_cover_pivot_ok && (cover_reload || (u3_aim_from_cover && safe_read(&cvt2,r14,8) && cvt2==runtime_image_base()+0x1670210));   /* (reload in a cover: the layer shown is the cover camera, which orbits the COVER's pivot, not the aim's shoulder pivot) */
+                    if (use_cp) {
+                        own[0]=u3_cover_pivot[0]; own[1]=u3_cover_pivot[1]; own[2]=u3_cover_pivot[2];
+                        /* (the pivot deduced before the aim can be stale or wrong when the game had pulled the camera in: the cover camera's own field +0x360 is the true one, read when it is sane; BB_U3_RELOADPIVOT=0: off) */
+                        static int rpv=-1; if (rpv<0) { const char *e=getenv("BB_U3_RELOADPIVOT"); rpv=!(e && e[0]=='0'); }
+                        float feet[3], fp[3];
+                        if (rpv && u3_player_feet(u3_cover_cam,feet) && safe_read(fp,u3_cover_cam+0x360,12)) {
+                            const float fy=fp[1]-feet[1], fx=fp[0]-feet[0], fz=fp[2]-feet[2];
+                            if (fy>0.5f && fy<2.2f && fx*fx+fz*fz<9.0f) { own[0]=fp[0]; own[1]=fp[1]; own[2]=fp[2]; }
+                        }
+                        if (mouse_debug()) { static uint64_t pl; if (now_us()-pl>200000) { pl=now_us(); printf("Mouse: U3 RELOADPIVOT T=%.4f own=%.3f,%.3f,%.3f cover_pivot=%.3f,%.3f,%.3f\n",now_us()*1e-6,(double)own[0],(double)own[1],(double)own[2],(double)u3_cover_pivot[0],(double)u3_cover_pivot[1],(double)u3_cover_pivot[2]); } }
+                    }
+                    else if (gp && !(u3_roll_press_us && now_us()-u3_roll_press_us<1500000)) { own[0]=u3_aim_pivot[0]; own[1]=u3_aim_pivot[1]; own[2]=u3_aim_pivot[2]; }
                     else u3_roll_pivot(p,1,own);
                 }
                 if (mouse_debug() && swap_only) printf("Mouse: U3 SWAPTURN T=%.4f cam=%llx aimcam=%llx w=%.3f hp=%.2f -> %.2f swap_ms=%.0f total=%.2f h0=%.2f\n",now_us()*1e-6,(unsigned long long)r14,(unsigned long long)u3_probe_aim_cam,(double)*(const float *)(uintptr_t)(r14+0x108),(double)hp,(double)u3_layer_heading,(double)((now_us()-u3_swap_press_us)*1e-3),(double)u3_aim_total_yaw,(double)u3_aim_h0);
                 if (mouse_debug() && !swap_only) { float hry=0.0f; double hra=0.0; const int hh=bbgpu_camera_yaw(&hry,&hra); printf("Mouse: U3 HELDREND rend=%.2f\n",hh ? (double)hry : 999.0); }
-                if (mouse_debug() && !swap_only) printf("Mouse: U3 HELDLAYER T=%.4f cam=%llx w=%.3f hp=%.2f ep=%.2f last_h=%.2f last_e=%.2f total=%.2f/%.2f gone_ms=%.0f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)hp,(double)ep,(double)u3_aim_last_heading,(double)u3_aim_last_elev,(double)u3_aim_total_yaw,(double)u3_aim_total_pitch,(double)(u3_aim_frame_us ? (now_us()-u3_aim_frame_us)*1e-3 : -1.0));
+                if (mouse_debug() && !swap_only) printf("Mouse: U3 HELDLAYER T=%.4f cam=%llx w=%.3f hp=%.2f ep=%.2f last_h=%.2f last_e=%.2f total=%.2f/%.2f gone_ms=%.0f cover_cam=%llx\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)hp,(double)ep,(double)u3_aim_last_heading,(double)u3_aim_last_elev,(double)u3_aim_total_yaw,(double)u3_aim_total_pitch,(double)(u3_aim_frame_us ? (now_us()-u3_aim_frame_us)*1e-3 : -1.0),(unsigned long long)u3_cover_cam);
                 if (swap_only) u3_turn_pose(p,own,wrap_degrees(hp-u3_layer_heading),ep-u3_layer_elev);
-                else u3_turn_pose(p,own,wrap_degrees(hp-u3_aim_last_heading),ep-u3_aim_last_elev);
+                else {
+                    float th=u3_aim_last_heading, te=u3_aim_last_elev;
+                    static float rl_h, rl_e; static uint64_t rl_us;
+                    if (rmode) {
+                        /* (fifth measure: AIMOUT of the returning aiming camera overwrites u3_aim_last_heading with the game's RAW heading (120 -> 146.75) before the layer's own AIMSTART block has run, so the picture jumped by 26 degrees for ~2 frames, and the cover_show copy below made the aim start from the raw one. Between that overwrite and AIMSTART (h0_ok clear) the last picture shown during the reload is kept.) */
+                        if (!u3_aim_h0_ok) {
+                            if (rl_us && now_us()>=rl_us && now_us()-rl_us<500000) { th=rl_h; te=rl_e; if (mouse_debug()) printf("Mouse: U3 RELOADHOLD T=%.4f cam=%llx kept %.2f,%.2f (last_aim %.2f,%.2f)\n",now_us()*1e-6,(unsigned long long)r14,(double)th,(double)te,(double)u3_aim_last_heading,(double)u3_aim_last_elev); }
+                            else return;   /* (no picture known: left alone, as at the start of any aim) */
+                        }
+                        else { rl_h=th; rl_e=te; rl_us=now_us(); }
+                    }
+                    /* The camera STEP at the end of a reload (measured 2026-11-14 with the rendered camera: 2.1 m, 3.6 m and 0.2 m in one frame, heading unchanged, 0.2 s before each of Wiktor's Tabs): the cover layer is on top and kept still at its 3 m while the aiming camera comes back under it and slides in to its own place; when the game drops the cover layer, the picture jumps from one to the other. While the aiming camera runs again after a reload, the layers carry ITS pose (position and rotation, as written one frame earlier): whichever is on top shows the same picture, and the slide is the aiming camera's own. BB_U3_RELOADFOLLOW=0: off */
+                    static int fol=-1; if (fol<0) { const char *e=getenv("BB_U3_RELOADFOLLOW"); fol=!(e && e[0]=='0'); }
+                    const uint64_t tf=now_us();
+                    if (fol && rmode && u3_aim_h0_ok && u3_aim_fin_us && tf>=u3_aim_fin_us && tf-u3_aim_fin_us<60000 && u3_reload_real_us && tf>=u3_reload_real_us && tf-u3_reload_real_us<1500000 && u3_aim_frame_us && tf>=u3_aim_frame_us && tf-u3_aim_frame_us<25000) {
+                        for (int i=0;i<3;++i) p[i]=u3_aim_fin[i];
+                        for (int i=0;i<4;++i) p[4+i]=u3_aim_fin[3+i];
+                        if (mouse_debug()) { static uint64_t fl; if (tf-fl>100000) { fl=tf; printf("Mouse: U3 RELOADFOLLOW T=%.4f cam=%llx pos=%.3f,%.3f,%.3f\n",tf*1e-6,(unsigned long long)r14,(double)p[0],(double)p[1],(double)p[2]); } }
+                    }
+                    else u3_turn_pose(p,own,wrap_degrees(hp-th),ep-te);
+                }
+                if (cover_reload && u3_aim_h0_ok) { u3_cover_show_h=u3_aim_last_heading; u3_cover_show_e=u3_aim_last_elev; u3_cover_show_us=now_us(); }   /* (the picture shown is the cover's: the aim that comes back after the reload starts from it, not from the game's raw heading, measured +39 degrees) */
                 if (mouse_debug() && swap_only) printf("Mouse: U3 SWFIN T=%.4f cam=%llx w=%.3f fin_pos=%.3f,%.3f,%.3f own=%.3f,%.3f,%.3f\n",now_us()*1e-6,(unsigned long long)r14,(double)*(const float *)(uintptr_t)(r14+0x108),(double)p[0],(double)p[1],(double)p[2],(double)own[0],(double)own[1],(double)own[2]);
             }
         }
@@ -5678,6 +5770,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         for (int i=0;i<3;++i) { p[i]=np[i]; p[4+i]=q[i]; }
         p[7]=q[3];
     }
+    if (held) { for (int i=0;i<3;++i) u3_aim_fin[i]=p[i]; for (int i=0;i<4;++i) u3_aim_fin[3+i]=p[4+i]; u3_aim_fin_us=now; }   /* (the aiming camera's own final pose, for u3 RELOADFOLLOW) */
     if (mouse_debug()) {   /* what is finally shown: position, heading and elevation of the pose written */
         const float fx=2.0f*(p[4]*p[6]+p[7]*p[5]), fy=2.0f*(p[5]*p[6]-p[7]*p[4]), fz=1.0f-2.0f*(p[4]*p[4]+p[5]*p[5]);
         float wry=0.0f; double wra=0.0; const int wh=bbgpu_camera_yaw(&wry,&wra);
