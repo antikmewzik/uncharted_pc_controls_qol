@@ -3768,9 +3768,21 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
         if (safe_read(in,g->rdx+0x70,32)) printf("Mouse: U3 AIMIN T=%.4f cam=%llx x=%.5f y=%.5f raw=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",now_us()*1e-6,(unsigned long long)camera,(double)in[1],(double)in[2],(double)in[0],(double)in[3],(double)in[4],(double)in[5],(double)in[6],(double)in[7]);
     }
 }
+static int u3_cover_drive_on(void) { static int cd=-1; if (cd<0) { const char *e=getenv("BB_U3_COVERDRIVE"); cd=!(e && e[0]=='0'); } return cd; }
 static void __attribute__((ms_abi)) u3_cover_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)image; (void)r14;
     u3_cover_seen_us=now_us(); u3_cover_cam=camera;
+    {   /* The cover camera's elevation (camera+0x2e0, degrees, up positive, clamped at 80; measured 2026-11-14 with the pad: it goes 5 -> 80 as the camera comes in from 3.0 m to 0.6 m along its ray, which the game's own collision does). The mouse's elevation is put there before the game updates, so that the game's collision runs at the mouse's angle (the pad's own behaviour), the mouse staying 1:1. The picture is then kept ABSOLUTE (a turn relative to the pose counted the turn twice: the view went on moving after the mouse stopped, measured 2026-11-14). BB_U3_COVERDRIVE=0: off */
+        const int cd=u3_cover_drive_on();
+        const uint64_t tn=now_us();
+        if (cd && !pad_only_mode && camera>0x10000 && u3_cover_show_us && tn>=u3_cover_show_us && tn-u3_cover_show_us<100000) {
+            float old=0.0f, nv=u3_cover_show_e; if (nv>80.0f) nv=80.0f; if (nv<-80.0f) nv=-80.0f;
+            if (safe_read(&old,camera+0x2e0,4) && old>-100.0f && old<100.0f) {
+                safe_write(camera+0x2e0,&nv,4);
+                if (mouse_debug()) { static uint64_t cdp; if (tn-cdp>100000) { cdp=tn; printf("Mouse: U3 COVERDRIVE T=%.4f game_e=%.2f -> %.2f\n",tn*1e-6,(double)old,(double)nv); } }
+            }
+        }
+    }
     /* BB_U3_COVERPROBE=<file>: the cover camera object's first 0x8000 bytes at every call (time, camera, out, bytes), to map its fields */
     static FILE *probe_f; static int probe_init; static unsigned probe_n;
     if (!probe_init) { probe_init=1; const char *p=getenv("BB_U3_COVERPROBE"); if (p && *p) probe_f=fopen(p,"wb"); }
@@ -4590,6 +4602,7 @@ static void u3_cover_layer(uint64_t r14) {
     static float abs_h, abs_e; static int abs_mode;
     if (u3_cover_pad_reset) {
         static int pr=-1; if (pr<0) { const char *e=getenv("BB_U3_COVERPADRESET"); pr=(e && e[0]=='1'); }   /* OFF by default (no visible effect in the 2026-11-12 test); BB_U3_COVERPADRESET=1: on */
+        if (u3_cover_drive_on()) pr=1;   /* (the pad moved the game's own elevation: the absolute picture is taken again from the pose) */
         u3_cover_pad_reset=0;
         if (pr) { u3_cover_yaw=u3_cover_pitch=0.0f; abs_mode=0; u3_cover_show_us=0; float ix, iy; camera_take(0,&ix,&iy); if (mouse_debug()) printf("Mouse: U3 cover PADRESET T=%.4f (pad in use: the mouse's turn is dropped)\n",now*1e-6); }
     }
@@ -4686,6 +4699,7 @@ static void u3_cover_layer(uint64_t r14) {
     float cf[3]; const float fwd[3]={0.0f,0.0f,1.0f};
     quat_rotate(cq,fwd,cf);
     const float hcq=SDL_atan2f(cf[0],cf[2])*57.29578f, ecq=SDL_asinf(cf[1]>1.0f ? 1.0f : cf[1]<-1.0f ? -1.0f : cf[1])*57.29578f;
+    if (!abs_mode && u3_cover_drive_on()) { abs_mode=1; abs_h=wrap_degrees(hcq-u3_cover_yaw); abs_e=ecq-u3_cover_pitch; }
     if (abs_mode) {
         /* p is the final picture (also while this camera comes back over the fading aim, its weight w rising 0 -> 1): it is put on the absolute heading. */
         const float hp=SDL_atan2f(f[0],f[2])*57.29578f;
