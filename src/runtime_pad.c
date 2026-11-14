@@ -4462,6 +4462,9 @@ static int u3_turn_pose_world(float *p, const float *pivot, float yaw, float pit
  * the pose the game gives each frame (yaw about the world up, pitch about the pose's side), about the pose's own position (the view stays at the head).
  * The mouse is taken natively (queue 2, fed while R3 is held and for ~1.3 s after), so it no longer goes through the emulated stick. */
 static int u3_player_feet(uint64_t cam, float *out3);
+static uint64_t u3_shield_sync_us; static float u3_shield_sync_h, u3_shield_sync_pitch;   /* heading / pitch the shield's V layer shows: the walking camera under it is put on them (or the fade back to it swings the picture) */
+static uint64_t u3_shield_sync_window_us(void) { static uint64_t v=0; if (!v) { const char *e=getenv("BB_U3_SHIELDWIN"); v=e && e[0] ? (uint64_t)atoll(e) : 35000; } return v; }
+static uint64_t u3_shield_us;   /* the V-class layer is shown by the shield (no V key): its pose is a third-person camera */
 static void u3_look_layer(uint64_t r14, uint64_t image) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -4482,7 +4485,7 @@ static void u3_look_layer(uint64_t r14, uint64_t image) {
     if (!v_known && w>0.99f) {
         static int vfo=-1; if (vfo<0) { const char *e=getenv("BB_U3_VFORCED"); vfo=!(e && e[0]=='0'); }
         uint64_t a=1, b=1, c=1;
-        if (safe_read(&a,r14+0x258,8) && safe_read(&b,r14+0x280,8) && safe_read(&c,r14+0x2a8,8)) { v_known=1; v_forced=vfo && a==0 && b==0 && c==0; if (mouse_debug()) printf("Mouse: U3 V forced=%d (%llx %llx %llx)\n",v_forced,(unsigned long long)a,(unsigned long long)b,(unsigned long long)c); }
+        if (safe_read(&a,r14+0x258,8) && safe_read(&b,r14+0x280,8) && safe_read(&c,r14+0x2a8,8)) { v_known=1; v_forced=vfo && a==0 && b==0 && c==0 && !(u3_shield_us && now-u3_shield_us<400000 && !look_held);   /* (the shield's V layer can read (0 0 0) too, measured 2026-11-14: taken for a forced V, the mouse was dead from then on) */ if (mouse_debug()) printf("Mouse: U3 V forced=%d (%llx %llx %llx)\n",v_forced,(unsigned long long)a,(unsigned long long)b,(unsigned long long)c); }
     }
     if (dump_pending && w>0.99f && mouse_debug()) {   /* (diagnostic 2026-11-13: the V camera object at the start of each V, to tell a V the game forces (hint: "press V to look at the window") from a free one) */
         dump_pending=0;
@@ -4492,6 +4495,12 @@ static void u3_look_layer(uint64_t r14, uint64_t image) {
     }
     last_us=now;
     u2_native_us=now;
+    { static int vpo=-1; if (vpo<0) { const char *e=getenv("BB_U3_VPOSE"); vpo=(e && e[0]=='1'); }   /* (diagnostic: the pose the game gives the V-class layer, before our turn, and the player's feet: sphere fit pad vs mouse) */
+      if (vpo && mouse_debug()) { float ft[3]={0,0,0}; const int ok=u3_player_feet(r14,ft); float f[3]; const float fw[3]={0,0,1}; quat_rotate(p+4,fw,f);
+        printf("Mouse: VPOSE T=%.4f pos=%.3f,%.3f,%.3f fwd=%.4f,%.4f,%.4f feet=%d %.3f,%.3f,%.3f tot=%.2f,%.2f\n",now*1e-6,p[0],p[1],p[2],f[0],f[1],f[2],ok,ft[0],ft[1],ft[2],(double)total_yaw,(double)total_pitch); } }
+    { static int sd=-1; if (sd<0) { const char *e=getenv("BB_U3_SHIELDDRAIN"); sd=!(e && e[0]=='0'); }
+      /* (shield: the mouse feeds queue 0 too, the walking camera's, which nobody read while the shield layer was shown; at the release the walking camera took the whole backlog in a few frames: 117 degrees in 0.25 s, measured. BB_U3_SHIELDDRAIN=0: off) */
+      if (sd && !look_held && u3_shield_us && now-u3_shield_us<400000) { float ix, iy; camera_take(0,&ix,&iy); } }
     if (v_forced) { float ix, iy; camera_take(2,&ix,&iy); camera_take(0,&ix,&iy); return; }
     if (!(frame_us && now-frame_us<1500)) {   /* (the layer can be called twice in one frame: the mouse is taken once) */
         float step, step_pitch;
@@ -4526,6 +4535,14 @@ static void u3_look_layer(uint64_t r14, uint64_t image) {
     /* (2026-11-13, pad vs mouse on the same sweep: with the pad the pitch goes round the game's centre (looking up, the camera ends 0.5 m from the player, he looms; round the player's axis it was 1.1 m and he sank to the
      * screen's bottom). So: pitch about the game's centre, then the yaw about the player's vertical, which keeps him still on the screen. BB_U3_VSPLIT=0: both about the player's axis) */
     static int sp=-1; if (sp<0) { const char *e=getenv("BB_U3_VSPLIT"); sp=!(e && e[0]=='0'); }
+    { static int shp=-1; if (shp<0) { const char *e=getenv("BB_U3_SHIELDPIV"); shp=!(e && e[0]=='0'); }   /* (shield: the camera is behind the player; both turns go round his chest, not round a point 2 m ahead of the pose. BB_U3_SHIELDPIV=0: the V pivot) */
+      float ft2[3];
+      if (shp && !look_held && u3_shield_us && now-u3_shield_us<400000 && u3_player_feet(r14,ft2)) { const float ch[3]={ft2[0],ft2[1]+1.3f,ft2[2]}; u3_turn_pose(p,ch,total_yaw,total_pitch);
+        { const float fw3[3]={0.0f,0.0f,1.0f}; float fo[3]; quat_rotate(p+4,fw3,fo); u3_shield_sync_h=heading_of(fo); u3_shield_sync_pitch=total_pitch; u3_shield_sync_us=now;
+          { static int st=-1; if (st<0) { const char *e=getenv("BB_U3_SHTRACE"); st=(e && e[0]=='1'); }
+            if (st && mouse_debug()) { float ry=0.0f; double ra=0.0; const int hv=bbgpu_camera_yaw(&ry,&ra); printf("Mouse: SHTR T=%.4f h=%.2f tot=%.2f,%.2f w=%.3f rend=%.2f%s\n",now*1e-6,(double)u3_shield_sync_h,(double)total_yaw,(double)total_pitch,(double)w,hv ? (double)ry : 0.0,hv ? "" : "?"); } }
+          if (mouse_debug()) { static uint64_t sy; if (now-sy>250000) { sy=now; printf("Mouse: U3 SHIELD sync heading=%.2f pitch=%.2f w=%.3f t=%.4f\n",(double)u3_shield_sync_h,(double)total_pitch,(double)w,now*1e-6); } } }
+        return; } }
     if (split && sp) { u3_turn_pose(p,cen,0.0f,total_pitch); u3_turn_pose(p,pivot,total_yaw,0.0f); }
     else u3_turn_pose(p,pivot,total_yaw,total_pitch);
 }
@@ -4559,6 +4576,13 @@ static int u3_player_feet(uint64_t cam, float *out3) {   /* the player's feet (A
     uint64_t hp=0, A=0; uint32_t ag=0, gen=0;
     if (!cam || !(safe_read(&hp,cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && safe_read(&gen,cam+0xb8,4) && ag==gen && safe_read(out3,A+0x4d0,12))) return 0;
     for (int i=0;i<3;++i) if (!(out3[i]>-100000.0f && out3[i]<100000.0f)) return 0;
+    /* (2026-11-14: on a moving platform (chapter 12's barge) A+0x4d0 is in the platform's frame; the world position is at A+0x1a0, one frame late. A difference over 1 m = platform frame. BB_U3_FEETWORLD=0: off) */
+    static int fw=-1; if (fw<0) { const char *e=getenv("BB_U3_FEETWORLD"); fw=!(e && e[0]=='0'); }
+    float w3[3];
+    if (fw && safe_read(w3,A+0x1a0,12) && w3[0]>-100000.0f && w3[0]<100000.0f && w3[1]>-100000.0f && w3[1]<100000.0f && w3[2]>-100000.0f && w3[2]<100000.0f) {
+        const float dx=w3[0]-out3[0], dz=w3[2]-out3[2];
+        if (dx*dx+dz*dz>1.0f) { out3[0]=w3[0]; out3[1]=w3[1]; out3[2]=w3[2]; }
+    }
     return 1;
 }
 static void u3_cover_floor(uint64_t cam, float *p) {
@@ -5185,6 +5209,16 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
         { static int l1aim_off=-1; if (l1aim_off<0) { const char *e=getenv("BB_U3_L1AIM"); l1aim_off=(e && e[0]=='0'); }
           if (!l1aim_off && l1_held && !l2_held && tvt==runtime_image_base()+0x16736f0 && tw>=0.005f) u3_turret_us=tn; }
         if (turret_on) u3_turret_us=tn;
+    }
+    /* U3 shield (2026-11-14): holding the shield shows the V look camera class (+0x1671c30) at full weight with no V key held (measured: 9 s of emulated stick). Its presence keeps the native mouse alive like a held V
+     * (the same layer turn, 1:1). BB_U3_SHIELD=0: off */
+    if (r14 && !aim_held && !look_held && (now_us()>=look_blend_until_us || (u3_shield_us && now_us()-u3_shield_us<400000))) {
+        static int shield_off=-1; if (shield_off<0) { const char *e=getenv("BB_U3_SHIELD"); shield_off=(e && e[0]=='0'); }
+        uint64_t vt=0; float vw=0.0f;
+        if (!shield_off && safe_read(&vt,r14,8) && vt==runtime_image_base()+0x1671c30 && safe_read(&vw,r14+0x108,4) && vw>0.005f) {   /* (from the first frame of the fade-in: at 0.99 the mouse was on the emulated stick for the 0.85 s of the fade) */
+            look_blend_until_us=now_us()+250000; u3_shield_us=now_us();
+            if (mouse_debug()) { static uint64_t sh_last; if (now_us()-sh_last>1000000) printf("Mouse: U3 SHIELD look layer without V key t=%.4f\n",now_us()*1e-6); sh_last=now_us(); }
+        }
     }
     if (r14 && !aim_held && (look_held || now_us()<look_blend_until_us)) {
         uint64_t vt=0;
@@ -6065,7 +6099,40 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
     follow_arc_max=0.76f;
     /* (measured 2026-11-11: the walking camera resumes under the fading hanging-aim layer and took the mouse from it, while the picture was still the layer's: the mouse was dead
      * until the layer was gone. The layer keeps the mouse while it is dispatched, 100 ms of grace) */
-    if (u3_hang_fade_us && now>=u3_hang_fade_us && now-u3_hang_fade_us<100000 && !aim_held) {
+    static int shsync=-1; if (shsync<0) { const char *e=getenv("BB_U3_SHIELDSYNC"); shsync=!(e && e[0]=='0'); }   /* BB_U3_SHIELDSYNC=0: off */
+    if (shsync && u3_shield_sync_us && now>=u3_shield_sync_us && now-u3_shield_sync_us>=100000 && now-u3_shield_sync_us<1500000 && mouse_debug()) {   /* (trace: the walking camera after the shield's layer is gone) */
+        float ry=0.0f; double ra=0.0; const int hv=bbgpu_camera_yaw(&ry,&ra);
+        printf("Mouse: SHPOST T=%.4f since=%.0fms dir=%.2f rend=%.2f%s arc=%.3f\n",now*1e-6,(double)((now-u3_shield_sync_us)*1e-3),(double)heading_of((const float *)(uintptr_t)(camera+0x78c0)),hv ? (double)ry : 0.0,hv ? "" : "?",(double)*(const float *)(uintptr_t)(camera+0x7874));
+    }
+    if (shsync && u3_shield_sync_us && now>=u3_shield_sync_us && now-u3_shield_sync_us<u3_shield_sync_window_us() && !aim_held) {   /* (measured 2026-11-14 SHPOST: with 100 ms the direction stood still for ~110 ms after the layer was gone, the mouse waiting in queue 0: a one-off stall of the turn at the release. BB_U3_SHIELDWIN=<us>) */
+        follow_applied=0.0f; follow_arc_moved=0;
+        float *cd=(float *)(uintptr_t)(camera+0x78c0), *carc=(float *)(uintptr_t)(camera+0x7874);
+        const float len=SDL_sqrtf(cd[0]*cd[0]+cd[2]*cd[2]);
+        if (len>0.001f && len<10.0f) {
+            /* (measured 2026-11-14, SHTR: the walking camera's rendered heading is its direction's heading + 180 (the direction points from the pivot to the camera), where the V layer's pose heading is the rendered one: the direction takes the pose's heading + 180, or the fade back to the walking camera blends two views 180 degrees apart. BB_U3_SHIELDFLIP=0: the old, unflipped value) */
+            static int fl=-1; if (fl<0) { const char *e=getenv("BB_U3_SHIELDFLIP"); fl=!(e && e[0]=='0'); }
+            const float a=(u3_shield_sync_h+(fl ? 180.0f : 0.0f))*0.017453293f, ox=cd[0], oz=cd[2];
+            cd[0]=-len*SDL_sinf(a); cd[2]=-len*SDL_cosf(a);
+            /* (the walking camera is not updated while the shield's layer is shown: at the release its shown position (+0x7680, about the pivot +0x78a0) is still at the old heading and its spring swept the whole turn, a full circle of the picture during the fade. The position is turned with the direction, as in the cover exit. BB_U3_SHIELDPOS=0: off) */
+            static int spo=-1; if (spo<0) { const char *e=getenv("BB_U3_SHIELDPOS"); spo=!(e && e[0]=='0'); }
+            const float l2=ox*ox+oz*oz;
+            if (spo && l2>1e-6f) {
+                /* (the shown position is PUT on the direction's azimuth, same radius, not turned by the delta: the game's own spring also pulls it, a turn by the delta counted twice and the picture spun again. Measured: position -> pivot azimuth = the direction's heading) */
+                float *ps=(float *)(uintptr_t)(camera+0x7680); const float *pv=(const float *)(uintptr_t)(camera+0x78a0);
+                const float px=ps[0]-pv[0], pz=ps[2]-pv[2], r=SDL_sqrtf(px*px+pz*pz);
+                const float nx=pv[0]+r*cd[0]/len, nz=pv[2]+r*cd[2]/len;
+                if (r>0.05f && r<50.0f && nx>-100000.0f && nx<100000.0f && nz>-100000.0f && nz<100000.0f) {
+                    if (mouse_debug()) { const float dd=wrap_degrees(SDL_atan2f(-px,-pz)*57.29578f-u3_shield_sync_h); if (dd>10.0f || dd<-10.0f) printf("Mouse: U3 SHIELD walking position put on heading (was %.1f deg off)\n",(double)dd); }
+                    ps[0]=nx; ps[2]=nz;
+                }
+            }
+        }
+        static uint64_t sh_arc_us; static float sh_arc0;
+        if (now-sh_arc_us>300000) sh_arc0=*carc;
+        sh_arc_us=now;
+        { const float v=sh_arc0+u3_shield_sync_pitch/105.0f; if (v==v) *carc=v<0.0f ? 0.0f : v>0.76f ? 0.76f : v; }
+    }
+    else if (u3_hang_fade_us && now>=u3_hang_fade_us && now-u3_hang_fade_us<100000 && !aim_held) {
         follow_applied=0.0f; follow_arc_moved=0;
         const float cy=u3_hang_carry_yaw, cp=u3_hang_carry_pitch;   /* (the walking camera under the fading layer takes the same turn, or the blend loses it) */
         u3_hang_carry_yaw=u3_hang_carry_pitch=0.0f;
