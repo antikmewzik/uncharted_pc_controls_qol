@@ -4892,6 +4892,7 @@ static volatile uint64_t u3_hang_fade_us;   /* last frame the hanging-aim layer 
 static float u3_hang_carry_yaw, u3_hang_carry_pitch;   /* the mouse's turn the layer took during its fade, owed to the walking camera under it (the picture blends the two: both must turn by the whole of it) */
 static int u3_hang_in_fade;
 static int u3_script_wide;   /* set by the caller of u3_script_layer for the hanging aim camera: wide limits */
+#include "u3_horsepin.inc"
 static void u3_script_layer(uint64_t r14, uint64_t image, int anim) {   /* anim: the ledge / climb camera (image+0x1671390), which the walking camera's update must not feed meanwhile */
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -5163,6 +5164,7 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
             return;
         }
     }
+    u3_horsepin_layer(r14);   /* U3 horseback, pad alone: no turn after the aim (module u3_horsepin.inc) */
     if (r14) {   /* U3 turret: the aiming-class layer (+0x16736f0) at full weight with L2 up for 0.3 s: the game aims without L2, the mouse must stay native (u3_turret_us counts as aim_held).
                   * Once detected it holds while the layer stays shown, L2 or not (measured 2026-11-03: the turret camera orbits a pivot 2.33 m straight ahead, no lateral offset) */
         static uint64_t turret_since_us, turret_seen_us; static int turret_on;
@@ -9251,6 +9253,7 @@ static void sample(PadData *d) {
     { static int prev_circle; const int c=(d->buttons & BTN_CIRCLE)!=0; if (c && !prev_circle && aim_held) u3_roll_press_us=now_us(); prev_circle=c; }   /* U3: the roll (Circle) pressed while aiming */
     { static int prev_l3; const int c=(d->buttons & BTN_L3)!=0; if (c && !prev_l3 && aim_held) u3_swap_press_us=now_us(); prev_l3=c; }   /* U3: the shoulder switch (L3) pressed while aiming */
     if (mouse_debug()) { static int prev_aim=-1; if (aim_held!=prev_aim) printf("Mouse: aim_held=%d T=%.4f\n",aim_held,now_us()*1e-6); prev_aim=aim_held; }
+    { static int pa; if (pa && !aim_held) u3_hp_release_us=now_us(); pa=aim_held; u3_hp_rx=d->right_x; u3_hp_ry=d->right_y; u3_hp_stick=(d->right_x>148 || d->right_x<108 || d->right_y>148 || d->right_y<108); if (aim_held && u3_hp_stick) u3_hp_aimstick=1; }   /* U3 horse, pad: the release of the aim and the right stick (u3_horsepin.inc) */
     if (aim_held) aim_blend_until_us=now_us()+1300000;
     aim_native=aim_held && zoom_camera_us && now_us()-zoom_camera_us<100000 && !(u2_zoom_under_us && now_us()-u2_zoom_under_us<100000) &&
                !(u2_zoom_below_cover_us && now_us()-u2_zoom_below_cover_us<100000);
