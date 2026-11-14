@@ -4555,9 +4555,25 @@ static void u3_cover_floor(uint64_t cam, float *p) {
     uint64_t hp=0, A=0; uint32_t ag=0, gen=0; float feet=0.0f;
     if (!(safe_read(&hp,cam+0xb0,8) && hp && safe_read(&A,hp,8) && A && safe_read(&ag,A+0x7c,4) && safe_read(&gen,cam+0xb8,4) && ag==gen && safe_read(&feet,A+0x4d4,4))) return;
     if (!(feet>-100000.0f && feet<100000.0f)) return;
+    static int sh=-1; if (sh<0) { const char *e=getenv("BB_U3_COVERSHORT"); sh=!(e && e[0]=='0'); }   /* BB_U3_COVERSHORT=0: the old floor (height clamp only, feet at A+0x4d4) */
+    float pv[3]={0,0,0}; int pv_ok=0;
+    if (sh && safe_read(pv,cam+0x360,12) && pv[0]>-100000.0f && pv[0]<100000.0f && pv[1]>-100000.0f && pv[1]<100000.0f && pv[2]>-100000.0f && pv[2]<100000.0f) {
+        const float dx=pv[0]-p[0], dy=pv[1]-p[1], dz=pv[2]-p[2];
+        pv_ok=dx*dx+dy*dy+dz*dz<36.0f;
+    }
+    if (pv_ok) {   /* (on a moving platform (chapter 12's barge) A+0x4d4 is in the platform's frame: 4 m off the world's height; the world position is at A+0x1a0 as for the aiming pivot. The feet are the candidate 0.3 to 2.5 m under the pivot.) */
+        float fw=0.0f; const int fw_ok=safe_read(&fw,A+0x1a4,4) && fw>-100000.0f && fw<100000.0f;
+        const float g=pv[1]-feet; const int local_ok=g>0.3f && g<2.5f;
+        if (!local_ok) { const float g2=pv[1]-fw; if (fw_ok && g2>0.3f && g2<2.5f) feet=fw; }
+    }
     const float lo=feet+margin;
     if (mouse_debug()) { static uint64_t fq; const uint64_t n=now_us(); if (n-fq>300000) { fq=n; printf("Mouse: U3 COVERFLOOR T=%.4f feet=%.3f cam_y=%.3f lo=%.3f%s\n",n*1e-6,(double)feet,(double)p[1],(double)lo,p[1]<lo ? " CLAMP" : ""); } }
-    if (p[1]<lo) p[1]=lo;
+    if (p[1]<lo) {
+        if (pv_ok && pv[1]>lo+0.05f) {   /* like the game with the pad (measured 2026-11-14: distance 3.0 m at 5 degrees, 1.1 at 49, 0.6 at 75-80): the camera comes in along its ray to the pivot, it does not slide under the player */
+            const float t=(pv[1]-lo)/(pv[1]-p[1]);
+            for (int i=0;i<3;++i) p[i]=pv[i]+(p[i]-pv[i])*t;
+        } else p[1]=lo;
+    }
 }
 static void u3_cover_layer(uint64_t r14) {
     static int disabled=-1;
@@ -5459,6 +5475,13 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
                 h0=u3_hold_h;
             }
         }
+        {   /* A quick second press while the previous aim's picture is still being shown (fade-out): the aiming camera restarts from the game's raw pose (measured with the AK, 2026-11-14: 27 degrees of heading and 90 of elevation off the picture on screen, so the view jumped away from where the player looked). A new aim starts from the picture on screen. BB_U3_REPRESS=0: off */
+            static int rp=-1; if (rp<0) { const char *e=getenv("BB_U3_REPRESS"); rp=!(e && e[0]=='0'); }
+            if (rp && held && !prev_held && !u3_aim_from_cover && u3_layer_us && now>=u3_layer_us && (now-u3_layer_us<150000 || (now-u3_layer_us<400000 && (w>0.5f || wrap_degrees(h0-u3_layer_heading)>20.0f || wrap_degrees(h0-u3_layer_heading)<-20.0f || e0-u3_layer_elev>20.0f || e0-u3_layer_elev<-20.0f))) && !(u3_roll_press_us && now-u3_roll_press_us<1500000) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
+                if (mouse_debug()) printf("Mouse: U3 REPRESS T=%.4f h0 %.2f -> %.2f e0 %.2f -> %.2f\n",now*1e-6,(double)h0,(double)u3_layer_heading,(double)e0,(double)u3_layer_elev);
+                h0=u3_layer_heading; e0=u3_layer_elev;
+            }
+        }
         {   /* Grenade launcher: the aiming camera comes back ~0.3 s after the throw (aim not held), after the "gone" branch has turned the layers: the picture it starts from already holds the whole turn, so the old total on top of the new h0 jumped the picture by 40-60 degrees (measured 2026-11-08). BB_U3_ROLLCONT=0 restores the old behaviour */
             static int rc2=-1; if (rc2<0) { const char *e=getenv("BB_U3_ROLLCONT"); rc2=!(e && e[0]=='0'); }
             if (rc2 && !held && !u3_aim_from_cover && u3_aim_frame_us && now>u3_aim_frame_us && now-u3_aim_frame_us>100000 && !(u3_roll_press_us && now-u3_roll_press_us<1500000) && !(u3_swap_press_us && now-u3_swap_press_us<1500000)) {
@@ -5511,6 +5534,19 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
     const float n=SDL_sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
     if (!(n>0.5f)) return;
     for (int i=0;i<4;++i) q[i]/=n;
+    {   /* A big tilt correction (the aiming camera restarting at +40 degrees when the picture held -68: 108 degrees in one step) leaves the heading off, because the tilt is turned about the pose's own X axis and the pose is not exactly level. The heading of the result is measured and put right by a turn about the vertical (it changes nothing else). BB_U3_HEADFIX=0: off (measured 2026-11-14: 19.6 degrees off on the first frame of a quick second press) */
+        static int hfx=-1; if (hfx<0) { const char *e=getenv("BB_U3_HEADFIX"); hfx=!(e && e[0]=='0'); }
+        if (hfx) {
+            float f2[3]; quat_rotate(q,look,f2);
+            const float hq=SDL_atan2f(f2[0],f2[2])*57.29578f, err=wrap_degrees(hd-hq);
+            if ((err>0.05f || err<-0.05f) && f2[1]<0.99f && f2[1]>-0.99f) {
+                const float y2=err*0.017453293f*0.5f, qy[4]={0.0f,SDL_sinf(y2),0.0f,SDL_cosf(y2)};
+                float q2[4]; quat_mul(qy,q,q2);
+                const float n2=SDL_sqrtf(q2[0]*q2[0]+q2[1]*q2[1]+q2[2]*q2[2]+q2[3]*q2[3]);
+                if (n2>0.5f) for (int i=0;i<4;++i) q[i]=q2[i]/n2;
+            }
+        }
+    }
     const float conj[4]={-p[4],-p[5],-p[6],p[7]};
     /* In a roll the aiming camera does not run: the pivot it left is stale (the player rolls away from it), orbiting it moved the picture sideways with every degree of turn; the camera turns about the pivot that follows the player (u3_roll_pivot), or on the spot when that is not known yet */
     const int roll_spot=held && u3_aim_frame_us && now-u3_aim_frame_us>=25000;
