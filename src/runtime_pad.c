@@ -4587,6 +4587,30 @@ static void u3_cover_floor(uint64_t cam, float *p) {
         } else p[1]=lo;
     }
 }
+/* The mouse turns the cover camera's final pose at a fixed 3 m, so it went through the wall (the game's own camera, with the pad, comes in:
+ * its collision is a sphere sweep along the camera's offset, asynchronous, one image late). The same sweep is sent from here for OUR
+ * direction (pivot -> turned pose, length of the game's offset) with the game's constants (start = pivot + 0.1 m along it, radius 0.25), and
+ * the pose is shortened to the first hit. u3_cover_wall_fraction: see the collision block before guest_callbacks (2026-11-14: the same
+ * inputs gave the game's own fraction on 217 of 217 samples). BB_U3_COVERWALL=0: off. */
+static int u3_cover_wall_fraction(const float *start4, const float *vec4, float radius, float *frac);
+static void u3_cover_wall(uint64_t cam, float *p) {
+    static int on=-1; if (on<0) { const char *e=getenv("BB_U3_COVERWALL"); on=!(e && e[0]=='0'); }
+    if (!on || !cam) return;
+    float P[4], V[4];
+    if (!safe_read(P,cam+0x4d0,16) || !safe_read(V,cam+0x4e0,16)) return;
+    for (int i=0;i<3;++i) if (!(P[i]>-100000.0f && P[i]<100000.0f && V[i]>-100.0f && V[i]<100.0f)) return;
+    const float vl=SDL_sqrtf(V[0]*V[0]+V[1]*V[1]+V[2]*V[2]);
+    if (!(vl>1.0f && vl<10.0f)) return;
+    const float dx=p[0]-P[0], dy=p[1]-P[1], dz=p[2]-P[2], L=SDL_sqrtf(dx*dx+dy*dy+dz*dz);
+    if (!(L>0.3f && L<12.0f)) return;
+    const float u[3]={dx/L,dy/L,dz/L};
+    const float st[4]={P[0]+0.1f*u[0],P[1]+0.1f*u[1],P[2]+0.1f*u[2],P[3]}, ve[4]={u[0]*vl,u[1]*vl,u[2]*vl,V[3]};
+    float fr=0.0f;
+    if (!u3_cover_wall_fraction(st,ve,0.25f,&fr) || !(fr>0.0f)) return;
+    float Lt=fr*vl; if (Lt<0.3f) Lt=0.3f;
+    if (mouse_debug()) { static uint64_t q; const uint64_t n=now_us(); if (n-q>200000) { q=n; printf("Mouse: U3 COVERWALL T=%.4f L=%.3f hit=%.3f frac=%.3f%s\n",n*1e-6,(double)L,(double)Lt,(double)fr,L>Lt+0.02f ? " SHORTEN" : ""); } }
+    if (L>Lt+0.02f) for (int i=0;i<3;++i) p[i]=P[i]+u[i]*Lt;
+}
 static void u3_cover_layer(uint64_t r14) {
     static int disabled=-1;
     if (disabled<0) { const char *e=getenv("BB_U3_NATIVE"); disabled=e && atoi(e)==0; }
@@ -4721,6 +4745,7 @@ static void u3_cover_layer(uint64_t r14) {
         { const float prev_h=u3_cover_show_h; u3_cover_show_h=abs_h; u3_cover_show_e=abs_e; u3_cover_show_us=now; u3_cover_measure_rend(now,prev_h,abs_h); }
         u3_turn_pose(p,pivot,wrap_degrees(hp-abs_h),ef-abs_e);
         u3_cover_floor(r14,p);
+        u3_cover_wall(r14,p);
         return;
     }
     if (u3_cover_show_us && now-u3_cover_show_us<100000) {
@@ -4738,6 +4763,7 @@ static void u3_cover_layer(uint64_t r14) {
     u3_cover_measure_rend(now,prev_h,u3_cover_show_h); }
     u3_turn_pose(p,pivot,u3_cover_yaw,u3_cover_pitch);
     u3_cover_floor(r14,p);
+    u3_cover_wall(r14,p);
 }
 /* After the walking camera has taken over from the cover its position shown goes on by its own speed (measured: 18 degrees past the heading, then
  * back) and the picture jumped. For 0.35 s the picture goes on from the heading the cover showed, turned by the mouse (u3_tk_h, kept by
@@ -6179,7 +6205,132 @@ static void __attribute__((ms_abi)) u3_look_state(uint64_t rdi,uint64_t rsi, uin
     safe_read(lim,g->rbx+0x24c,8); safe_read(sp,g->rdx+0x544,8);
     printf("Mouse: U3 LOOK aim=%d T=%.4f rbx=%llx y=%.5f p=%.5f ys=%.5f ps=%.5f lim=%.4f,%.4f speed=%.4f,%.4f\n",(int)aim_held,now_us()*1e-6,(unsigned long long)g->rbx,(double)st[0],(double)st[1],(double)st[4],(double)st[5],(double)lim[0],(double)lim[1],(double)sp[0],(double)sp[1]);
 }
+#ifdef _WIN32
+/* PROTOTYPE (BB_U3_COLLPROBE=1, logging only, writes nothing in the game): calls the game's own camera
+ * collision (an asynchronous sphere sweep on a "probe" object: init 0x1131350, send 0x11843d0, ready
+ * 0x1131bc0, read 0x1184520) from host code, with the inputs the cover camera sends at 0x4ce050, and
+ * compares our result with the game's (read at 0x4ce160). Guest code is native x86-64 (System V);
+ * bb_guest_call bridges from the Microsoft convention. Notes: agent_docs\u3.md, "Routine de collision". */
+typedef struct { uint64_t fn, rdi, rsi, rdx, rcx, r8, r9; float x0, x1; uint64_t stack0, rax; float xret; } BBGuestCall;
+void bb_guest_call(BBGuestCall *c);
+#define BBX_SAVE(n,o) "movdqu xmmword ptr [rsp+" #o "], xmm" #n "\n\t"
+#define BBX_LOAD(n,o) "movdqu xmm" #n ", xmmword ptr [rsp+" #o "]\n\t"
+__asm__(".intel_syntax noprefix\n\t.text\n\t.globl bb_guest_call\nbb_guest_call:\n\t"
+        "push rbp\n\tmov rbp, rsp\n\tpush rbx\n\tpush rsi\n\tpush rdi\n\tpush r12\n\tsub rsp, 0xb0\n\t"
+        BBX_SAVE(6,0x10) BBX_SAVE(7,0x20) BBX_SAVE(8,0x30) BBX_SAVE(9,0x40) BBX_SAVE(10,0x50)
+        BBX_SAVE(11,0x60) BBX_SAVE(12,0x70) BBX_SAVE(13,0x80) BBX_SAVE(14,0x90) BBX_SAVE(15,0xa0)
+        "mov rbx, rcx\n\tmov rax, [rbx+0x40]\n\tmov [rsp], rax\n\t"
+        "mov rdi, [rbx+8]\n\tmov rsi, [rbx+16]\n\tmov rdx, [rbx+24]\n\tmov rcx, [rbx+32]\n\tmov r8, [rbx+40]\n\tmov r9, [rbx+48]\n\t"
+        "movss xmm0, [rbx+56]\n\tmovss xmm1, [rbx+60]\n\txor eax, eax\n\tcall [rbx]\n\t"
+        "mov [rbx+0x48], rax\n\tmovss [rbx+0x50], xmm0\n\t"
+        BBX_LOAD(6,0x10) BBX_LOAD(7,0x20) BBX_LOAD(8,0x30) BBX_LOAD(9,0x40) BBX_LOAD(10,0x50)
+        BBX_LOAD(11,0x60) BBX_LOAD(12,0x70) BBX_LOAD(13,0x80) BBX_LOAD(14,0x90) BBX_LOAD(15,0xa0)
+        "add rsp, 0xb0\n\tpop r12\n\tpop rdi\n\tpop rsi\n\tpop rbx\n\tpop rbp\n\tret\n\t.att_syntax\n");
+static uint64_t coll_call(uint64_t fn, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, float x0, float *xr) {
+    BBGuestCall k={fn,a,b,c,d,e,f,x0,0.0f,0,0,0.0f};
+    bb_guest_call(&k);
+    if (xr) *xr=k.xret;
+    return k.rax;
+}
+static const unsigned char u3_coll_submit_code[]={0x4c,0x89,0xff,0x48,0x89,0xda,0xe8,0x75};
+static const unsigned char u3_coll_read_code[]={0xc5,0xfa,0x11,0x85,0xf0,0xfd,0xff,0xff};
+static volatile float coll_game_frac=-1.0f;
+static volatile uint64_t coll_game_us;
+static float coll_saved_xmm0(const RuntimeGuestRegs *g) {   /* the thunk keeps xmm0-7 at (rbx&-16)-0xb0+0x30 */
+    float v=0.0f;
+    safe_read(&v,((uint64_t)(uintptr_t)g&~(uint64_t)15)-0xb0u+0x30u,4);
+    return v;
+}
+static int coll_probe_on(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("BB_U3_COLLPROBE"); on=(e && e[0] && e[0]!='0'); }
+    return on;
+}
+static void __attribute__((ms_abi)) u3_coll_read(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
+    (void)rdi; (void)rsi; (void)image; (void)r14;
+    if (!coll_probe_on()) return;
+    coll_game_frac=coll_saved_xmm0((const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60));
+    coll_game_us=now_us();
+}
+typedef struct {
+    unsigned char mem[0x100] __attribute__((aligned(64)));
+    float start[4] __attribute__((aligned(16))), vec[4] __attribute__((aligned(16)));
+    uint64_t filter[2] __attribute__((aligned(16)));
+    int inited, pending, ready;
+    float last;
+} CollProbe;
+/* One sweep step: read last image's result of this probe, then send the new query (start, vec, filter, radius). */
+static float coll_step(CollProbe *p, uint64_t image, const float *st, const float *ve, const uint64_t *fl, float radius) {
+    if (!p->inited) {   /* what the camera's constructor does to its probe (camera+0x440 ...) */
+        const uint32_t m1=0xffffffffu; const uint16_t m2=0xffffu; const uint8_t two=2;
+        memset(p->mem,0,sizeof(p->mem));
+        const uint64_t vt=image+0x16bc4d0; memcpy(p->mem,&vt,8);
+        memcpy(p->mem+0x1c,&m2,2); memcpy(p->mem+0x1e,&two,1);
+        memcpy(p->mem+0x24,&m1,4); memcpy(p->mem+0x28,&m1,4); memcpy(p->mem+0x44,&m1,4);
+        p->inited=1; p->last=-1.0f; p->ready=-1;
+    }
+    if (p->pending) {
+        p->ready=(int)(coll_call(image+0x1131bc0,(uint64_t)(uintptr_t)p->mem,0,0,0,0,0,0.0f,NULL)&0xff);
+        if (p->ready) { float fr=-1.0f; coll_call(image+0x1184520,(uint64_t)(uintptr_t)p->mem,(uint64_t)(uintptr_t)p->vec,0,0,0,0,0.0f,&fr); p->last=fr; }
+    }
+    memcpy(p->start,st,16); memcpy(p->vec,ve,16); memcpy(p->filter,fl,16);
+    coll_call(image+0x1131350,(uint64_t)(uintptr_t)p->mem,1,5,0x200,4,0,0.0f,NULL);
+    coll_call(image+0x11843d0,(uint64_t)(uintptr_t)p->mem,(uint64_t)(uintptr_t)p->start,(uint64_t)(uintptr_t)p->vec,(uint64_t)(uintptr_t)p->filter,0,0,radius,NULL);
+    p->pending=1;
+    return p->last;
+}
+static void __attribute__((ms_abi)) u3_coll_submit(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) {
+    (void)rdi; (void)r14;
+    if (!coll_probe_on()) return;
+    const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    static CollProbe mirror, own, fan_a, fan_b;
+    static int count; static float max_dstart, max_dradius;
+    float st[4], ve[4], pv[4]; uint64_t fl[2];
+    if (!safe_read(st,rsi,16) || !safe_read(ve,g->rbx,16) || !safe_read(fl,g->rcx,16) || !safe_read(pv,g->rbx-0x10,16)) return;   /* pivot = camera+0x4d0 */
+    const float radius=coll_saved_xmm0(g);
+    const float mirror_r=coll_step(&mirror,image,st,ve,fl,radius);
+    /* our own inputs: start = pivot + 0.1*normalize(vec), radius 0.25 (the game's constants, times a scale of 1) */
+    const float vl=SDL_sqrtf(ve[0]*ve[0]+ve[1]*ve[1]+ve[2]*ve[2]);
+    float mst[4]={pv[0],pv[1],pv[2],st[3]};
+    if (vl>1e-4f) for (int k=0;k<3;++k) mst[k]+=0.1f*ve[k]/vl;
+    const float ds=SDL_sqrtf((mst[0]-st[0])*(mst[0]-st[0])+(mst[1]-st[1])*(mst[1]-st[1])+(mst[2]-st[2])*(mst[2]-st[2]));
+    if (ds>max_dstart) max_dstart=ds;
+    if (SDL_fabsf(radius-0.25f)>max_dradius) max_dradius=SDL_fabsf(radius-0.25f);
+    const float own_r=coll_step(&own,image,mst,ve,fl,0.25f);
+    float va[4]={0}, vb[4]={0};   /* the same query turned by -20 and +20 degrees around the vertical (y) */
+    const float c=0.93969262f, s=0.34202014f;
+    va[0]=ve[0]*c+ve[2]*s; va[2]=-ve[0]*s+ve[2]*c; va[1]=ve[1]; va[3]=ve[3];
+    vb[0]=ve[0]*c-ve[2]*s; vb[2]=ve[0]*s+ve[2]*c; vb[1]=ve[1]; vb[3]=ve[3];
+    float sa[4]={st[0],st[1],st[2],st[3]}, sb[4]={st[0],st[1],st[2],st[3]};
+    const float fa=coll_step(&fan_a,image,sa,va,fl,0.25f), fb=coll_step(&fan_b,image,sb,vb,fl,0.25f);
+    if ((++count%10)==0) {
+        const uint64_t tn=now_us();
+        printf("Mouse: U3 COLLPROBE T=%.4f n=%d mirror=%.4f own=%.4f game=%.4f age=%.1fms fan-20=%.4f fan+20=%.4f maxdstart=%.5f maxdradius=%.5f radius=%.3f vl=%.3f\n",
+               tn*1e-6,count,(double)mirror_r,(double)own_r,(double)coll_game_frac,coll_game_us ? (double)(tn-coll_game_us)*1e-3 : -1.0,
+               (double)fa,(double)fb,(double)max_dstart,(double)max_dradius,(double)radius,(double)vl);
+    }
+}
+/* The cover camera's own sweep for the mouse's direction (u3_cover_wall): one step per image at most, the result of the previous one. */
+static int u3_cover_wall_fraction(const float *start4, const float *vec4, float radius, float *frac) {
+    static CollProbe probe; static uint64_t last_us, fresh_us;
+    const uint64_t now=now_us();
+    if (!last_us || now<last_us || now-last_us>=4000) {
+        const uint64_t filter[2]={0x619eull|(0x2000ull<<32),0};
+        coll_step(&probe,runtime_image_base(),start4,vec4,filter,radius);
+        last_us=now;
+        if (probe.ready==1) fresh_us=now;
+    }
+    *frac=probe.last;
+    return probe.last>0.0f && fresh_us && now>=fresh_us && now-fresh_us<150000;
+}
+#else
+static int u3_cover_wall_fraction(const float *start4, const float *vec4, float radius, float *frac) { (void)start4; (void)vec4; (void)radius; (void)frac; return 0; }
+#endif
 static const RuntimeGuestCallback guest_callbacks[]={
+#ifdef _WIN32
+    {"U3 collision probe (submit)",0x4ce050,u3_coll_submit_code,sizeof(u3_coll_submit_code),6,u3_coll_submit,NULL},
+    {"U3 collision probe (read)",0x4ce160,u3_coll_read_code,sizeof(u3_coll_read_code),8,u3_coll_read,NULL},
+#endif
     {"U3 aiming camera (output)",0x515128,u3_aim_out_code,sizeof(u3_aim_out_code),7,u3_aim_out,NULL},
     {"U3 look state (observe)",0x500a26,u3_look_state_code,sizeof(u3_look_state_code),8,u3_look_state,NULL},
     {"U3 layer blend (mouse)",0x10193f2,u3_layer_probe_code,sizeof(u3_layer_probe_code),7,u3_layer_blend,NULL},
