@@ -3704,6 +3704,7 @@ static volatile uint64_t u3_sticktest_us;  /* (measure) when the aim last ran wi
 static volatile int u3_sticktest_rx=128;  /* (measure, BB_U3_STICKTEST) the right stick x the test is sending */
 static volatile uint64_t u3_probe_aim_cam;  /* the aiming camera object, compared (never written) at the end of the layer blend */
 static float u3_dbg_dx, u3_dbg_dy;   /* the raw mouse pixels taken by the last update of the aiming camera (BB_MOUSE_DEBUG trace) */
+static float u3_head_ts; static uint64_t u3_head_ts_us;   /* (BB_U3_HEADLP) the smoothed heading sent to 11e0, and when: the picture shows the same, so that Drake's body and the camera turn together */
 static float u3_head_base, u3_head_elev; static uint64_t u3_head_base_us, u3_head_act_us;   /* (BB_U3_HEAD11E0) the pose heading the game produced on the last aiming update, and when */
 static float u3_aim_e0, u3_aim_total_pitch;
 static float u3_recoil_pend; static float u3_v_wr_el; static uint64_t u3_v_wr_us, u3_v_wr_cam;   /* (BB_U3_RECOIL: see u3_aim_out; the elevation of camera+0x11e0 as we left it, and when) */
@@ -3716,6 +3717,12 @@ static uint64_t u3_reload_us, u3_reload_raw_us, u3_reload_real_us; static float 
 static float u3_aim_fin[7]; static uint64_t u3_aim_fin_us;   /* (the aiming camera's final pose: position, quaternion; and when) */
 static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t camera, uint64_t image, uint64_t r14) {
     (void)out; (void)camera; (void)image; (void)r14; u3_aim_seen_us=now_us(); u3_probe_aim_cam=camera;
+    {   /* (sonde BB_U3_ADUMP=1, mouse AND pad, 2026-11-14: the player object A at each aiming update, with 11e0's heading as the game has it at entry, to compare Drake's own motion pad against mouse) */
+        static int ad=-1; if (ad<0) { const char *e=getenv("BB_U3_ADUMP"); ad=(e && e[0]=='1'); }
+        if (ad && mouse_debug() && aim_held) { uint64_t hq2=0, A2=0; static unsigned char ab[0x800]; float v11[4]={0};
+            if (safe_read(&hq2,camera+0xb0,8) && hq2 && safe_read(&A2,hq2,8) && A2 && safe_read(ab,A2,0x800) && safe_read(v11,camera+0x11e0,16)) {
+                printf("Mouse: U3 ADUMP2 T=%.4f yaw11e0=%.3f fromcover=%d ",now_us()*1e-6,(double)(SDL_atan2f(v11[0],v11[2])*57.29578f),(int)u3_aim_from_cover); for (unsigned i=0;i<0x800;++i) printf("%02x",ab[i]); printf("\n"); } }
+    }
     {   /* (test, BB_U3_HEAD11E0=1, 2026-11-12) the game's aim heading is the vector camera+0x11e0 (turned by the stick in 0x511370, read by 0x50bcb0 in this update):
          * for an aim begun in cover, turn it ourselves by the mouse's turn since the last update, so the game's wall collision runs at our heading with no 85 deg/s cap.
          * u3_aim_out's cover branch is absolute (shown = h0 - total) and measures the game's heading, so it needs no change. */
@@ -3735,7 +3742,13 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
         { static uint64_t rk; if (rk!=u3_rebase_key) { rk=u3_rebase_key; prev_us=0; } }   /* (the rebase moves h0 and zeroes the total: the target jumps, that step is not the mouse's) */
         /* (while quiet the loop is not closed on the pose, which is unreliable then, but the mouse's own turn still goes to 11e0 so the game's collision follows our heading: a first version wrote nothing, the mouse turned 125 degrees meanwhile and 131 degrees were written at once on resuming, 2026-11-13) */
         if (hv && aim_held && (u3_aim_from_cover || u3_aim_cover_swap) && u3_aim_h0_ok && camera) {
-            const float target=u3_aim_h0-u3_aim_total_yaw;
+            float target=u3_aim_h0-u3_aim_total_yaw;
+            {   /* (2026-11-14 test, BB_U3_HEADLP=<0..1>, 1 = off) Drake's body trembles with the mouse in a cover-born aim: the per-update turn alternates 4.0/6.7/4.4/6.4 degrees (mouse events against the 73 Hz updates) and goes straight to 11e0. Exponential smoothing of the target sent to 11e0 */
+                static float lp=-1.0f; if (lp<0.0f) { const char *e=getenv("BB_U3_HEADLP"); lp=e && e[0] ? (float)atof(e) : 0.45f; }   /* (0.45 default since 2026-11-15, "c'est bon pour l'instant"; 1 = off) */
+                static float ts, tv; static uint64_t ts_us; static uint64_t ts_cam;
+                /* alpha-beta filter (2026-11-15): the plain exponential one lagged 10-14 degrees at full sweep ("the camera feels soft"); this one tracks a constant speed with no lag and only smooths the uneven steps. alpha = BB_U3_HEADLP, beta = alpha^2/(2-alpha) (critical damping) */
+                if (lp<1.0f) { if (ts_cam==camera && ts_us && tn>ts_us && tn-ts_us<100000) { float dtf=(float)(tn-ts_us)*1e-6f; if (dtf<0.004f) dtf=0.004f; if (dtf>0.05f) dtf=0.05f; const float xp=ts+tv*dtf, rr=wrap_degrees(target-xp); ts=wrap_degrees(xp+lp*rr); tv+=lp*lp/(2.0f-lp)/dtf*rr; { const float after=wrap_degrees(target-ts); if (tv*after<0.0f) { ts=target; tv=0.0f; } } }   /* (never past the mouse's own heading: a flick that stops dead overshot and came back, 2026-11-15) */ else { ts=target; tv=0.0f; } ts_us=tn; ts_cam=camera; target=ts; u3_head_ts=ts; u3_head_ts_us=tn; }
+            }
             u3_head_act_us=tn;
             float d=0.0f;
             /* The aiming camera that comes back after a reload in a cover copies the picture we showed (turned by the mouse, up to ~100 degrees off) into its aim vector 0x11e0, and the game turns Drake's body to it in one frame: the "pop" seen in the clip 2026-11-14 (size follows the turn made during the reload: 56 -> 7.9, 60 -> 11.1, 106 -> 16.0). The pad cannot turn the view that far from Drake, so the game never meets it. The vector starts from the heading the game itself had (the cover camera's raw heading) and goes to the picture's at BB_U3_HEADRATE degrees a second (default 300): Drake turns instead of popping, the picture stays 1:1 (it is absolute). BB_U3_HEADSMOOTH=0: off */
@@ -3771,8 +3784,33 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
             }
             static int closed=-1; if (closed<0) { const char *e=getenv("BB_U3_HEADCLOSED"); closed=!(e && e[0]=='0'); }   /* closed loop (default): turn 11e0 by the gap between the heading we want and the pose heading the game produced on the last update (the pose sits ~10 degrees off the direction), so u3_aim_out has nothing left to turn and the picture is the game's own pose, as with the pad. BB_U3_HEADCLOSED=0: turn by the mouse's delta only */
             const int use_closed=closed && !swap_quiet;
-            if (use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
+            static int hoff=-1; if (hoff<0) { const char *e=getenv("BB_U3_HEADOFF"); hoff=(e && e[0]=='1'); }   /* (off by default: tested 2026-11-14, pivot right but the tremble stays) */   /* (2026-11-14) BB_U3_HEADOFF=0: old loop. Default: Drake's body trembled with the mouse because the loop added the WHOLE gap target - previous pose to 11e0 (gain 1), so the game's pose noise went straight into the vector Drake follows. Now the pose-minus-11e0 offset is measured on what we last wrote, low-passed (BB_U3_HEADOFFK, 0.12), and 11e0 is set to target - offset: the pivot stays right, the noise is filtered */
+            static float off_f, last_wr_yaw; static uint64_t last_wr_us, last_wr_cam; static int off_ok;
+            static float off_k=-1.0f; if (off_k<0.0f) { const char *e=getenv("BB_U3_HEADOFFK"); off_k=e && e[0] ? (float)atof(e) : 0.12f; }
+            int off_used=0;
+            if (hoff && use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) {
+                float vc[4];
+                if (last_wr_cam==camera && last_wr_us && u3_head_base_us>last_wr_us && u3_head_base_us-last_wr_us<100000 && safe_read(vc,camera+0x11e0,16) && (vc[0]*vc[0]+vc[2]*vc[2])>0.0001f) {
+                    const float om=wrap_degrees(u3_head_base-last_wr_yaw);
+                    if (!off_ok || last_wr_us+300000<tn) { off_f=om; off_ok=1; } else off_f=wrap_degrees(off_f+off_k*wrap_degrees(om-off_f));
+                    d=wrap_degrees((target-off_f)-SDL_atan2f(vc[0],vc[2])*57.29578f); off_used=1;
+                }
+            }
+            if (off_used) { }
+            else if (use_closed && u3_head_base_us && tn>u3_head_base_us && tn-u3_head_base_us<100000) d=wrap_degrees(target-u3_head_base);
             else if (prev_us && tn>prev_us && tn-prev_us<100000) d=wrap_degrees(target-prev_target);
+            static float hyb_w; hyb_w=0.0f;
+            {   /* (2026-11-14 test, BB_U3_HEADHYB=0 off) the closed loop makes the game's own pose the picture, and that pose trembles (azimuth +-1.25 degrees rms) when the mouse sweeps fast; the pad never does. Fast sweep: turn 11e0 by the mouse's delta only (the picture is then ours, absolute); slow: closed loop, so the wall collision follows. Blend between BB_U3_HYBLO (150) and BB_U3_HYBHI (300) degrees a second, smoothed */
+                static int hy=-1; if (hy<0) { const char *e=getenv("BB_U3_HEADHYB"); hy=(e && e[0]=='1'); }   /* (off by default: tested 2026-11-14, the tremble stays) */
+                static float lo=-1.0f, hi=-1.0f; if (lo<0.0f) { const char *e=getenv("BB_U3_HYBLO"); lo=e && e[0] ? (float)atof(e) : 150.0f; e=getenv("BB_U3_HYBHI"); hi=e && e[0] ? (float)atof(e) : 300.0f; }
+                static float vs;
+                if (hy && use_closed && prev_us && tn>prev_us && tn-prev_us<100000) {
+                    const float dd=wrap_degrees(target-prev_target), dt=(float)(tn-prev_us)*1e-6f;
+                    float sp=SDL_fabsf(dd)/dt; vs+=0.35f*(sp-vs);
+                    float w=(vs-lo)/(hi-lo); if (w<0.0f) w=0.0f; if (w>1.0f) w=1.0f;
+                    hyb_w=w; d=(1.0f-w)*d+w*dd;
+                } else vs=0.0f;
+            }
             prev_target=target; prev_us=tn;
             float v[4];
             static int pitch_on=-1; if (pitch_on<0) { const char *e=getenv("BB_U3_HEADPITCH"); pitch_on=!(e && e[0]=='0'); }   /* the height too (11e0's y): the game's own pitch geometry, not our rotation of its pose. BB_U3_HEADPITCH=0: off */
@@ -3787,7 +3825,7 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
                     }
                 }
                 float te=u3_aim_e0+u3_recoil_pend-u3_aim_total_pitch; if (te>75.0f) te=75.0f; if (te<-75.0f) te=-75.0f;
-                de=te-u3_head_elev;
+                de=(te-u3_head_elev)*(1.0f-hyb_w);
                 if (mouse_debug()) { float vv[4]={0}; safe_read(vv,camera+0x11e0,16); const float vh=SDL_sqrtf(vv[0]*vv[0]+vv[2]*vv[2]); printf("Mouse: U3 PITCHLOOP T=%.4f pose=%.3f te=%.3f de=%.3f v11e0_el=%.3f e0=%.2f tot=%.2f\n",tn*1e-6,(double)u3_head_elev,(double)te,(double)de,(double)(SDL_atan2f(vv[1],vh)*57.29578f),(double)u3_aim_e0,(double)u3_aim_total_pitch); }   /* (trace for the recoil in a cover-born aim) */
             }
             if (!sm_handled && (d!=0.0f || de!=0.0f) && safe_read(v,camera+0x11e0,16) && (v[0]*v[0]+v[2]*v[2])>0.0001f) {
@@ -3802,7 +3840,12 @@ static void __attribute__((ms_abi)) u3_aim_camera_seen(uint64_t out, uint64_t ca
                 v[0]=x; v[2]=z;
                 safe_write(camera+0x11e0,v,16);
             }
+            { float vy[4]; if (safe_read(vy,camera+0x11e0,16) && (vy[0]*vy[0]+vy[2]*vy[2])>0.0001f) { last_wr_yaw=SDL_atan2f(vy[0],vy[2])*57.29578f; last_wr_us=tn; last_wr_cam=camera; } }
             { float vw[4]; if (safe_read(vw,camera+0x11e0,16)) { const float vwh=SDL_sqrtf(vw[0]*vw[0]+vw[2]*vw[2]); if (vwh>0.01f) { u3_v_wr_el=SDL_atan2f(vw[1],vwh)*57.29578f; u3_v_wr_us=tn; u3_v_wr_cam=camera; } } }   /* (the vector as we leave it) */
+            { static int hl=-1; if (hl<0) { const char *e=getenv("BB_U3_HLOOP"); hl=(e && e[0]=='1'); }
+              if (hl) { uint64_t hq=0, Aq=0; float qb4[4]={0}, pq[4]={0}, p1[4]={0}; if (safe_read(&hq,camera+0xb0,8) && hq && safe_read(&Aq,hq,8) && Aq) { safe_read(qb4,Aq+0xe0,16); safe_read(pq,Aq+0x4d0,16); safe_read(p1,Aq+0x1a0,16); }   /* (sonde 2026-11-14: Drake's body yaw A+0xe0 and position, same update) */
+                printf("Mouse: U3 HLOOPA T=%.4f bodyyaw=%.3f pos4d0=%.3f,%.3f,%.3f pos1a0=%.3f,%.3f,%.3f\n",tn*1e-6,(double)(SDL_atan2f(2.0f*(qb4[3]*qb4[1]+qb4[0]*qb4[2]),1.0f-2.0f*(qb4[0]*qb4[0]+qb4[1]*qb4[1]))*57.29578f),(double)pq[0],(double)pq[1],(double)pq[2],(double)p1[0],(double)p1[1],(double)p1[2]); }
+              if (hl) { float vq[4]; if (safe_read(vq,camera+0x11e0,16)) { const float vqh=SDL_sqrtf(vq[0]*vq[0]+vq[2]*vq[2]); printf("Mouse: U3 HLOOP T=%.4f d=%.3f de=%.3f wr_yaw=%.3f wr_el=%.3f base=%.3f elev=%.3f fin=%.3f,%.3f,%.3f target=%.3f\n",tn*1e-6,(double)d,(double)de,(double)(SDL_atan2f(vq[0],vq[2])*57.29578f),(double)(SDL_atan2f(vq[1],vqh)*57.29578f),(double)u3_head_base,(double)u3_head_elev,(double)u3_aim_fin[0],(double)u3_aim_fin[1],(double)u3_aim_fin[2],(double)target); } } }
             if (mouse_debug()) { static uint64_t hp; if (tn-hp>100000) { hp=tn; printf("Mouse: U3 HEAD11E0 T=%.4f d=%.3f target=%.2f v11e0=%.3f,%.3f,%.3f yaw11e0=%.2f\n",tn*1e-6,(double)d,(double)target,(double)v[0],(double)v[1],(double)v[2],(double)(SDL_atan2f(v[0],v[2])*57.29578f)); } }
         } else prev_us=0;
     }
@@ -4353,6 +4396,8 @@ static void __attribute__((ms_abi)) u3_aim_out(uint64_t rdi,uint64_t rsi, uint64
         if (e0r-*total_pitch>80.0f) *total_pitch=e0r-80.0f;
         if (e0r-*total_pitch<-80.0f) *total_pitch=e0r+80.0f;
         yaw_use=wrap_degrees(base_heading-(u3_aim_h0-*total_yaw));
+        { static int tsh=-1; if (tsh<0) { const char *e=getenv("BB_U3_HEADLPSHOW"); tsh=!(e && e[0]=='0'); }   /* (BB_U3_HEADLPSHOW=0: the picture stays on the raw target) */
+          if (tsh && u3_head_ts_us && now>=u3_head_ts_us && now-u3_head_ts_us<60000) yaw_use=wrap_degrees(base_heading-u3_head_ts); }
         pitch_use=elevation-(e0r-*total_pitch);
     }
     else if (!blending_out && u3_aim_h0_ok) {   /* the aiming camera's own start height is not the picture's (measured: 61 degrees against 12 after a vertical mouse move, the 2nd press jumped): the height is absolute too */
@@ -5727,9 +5772,13 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
     /* From cover the mouse's turn made since the press is brought in with the fade-in (weight w): the camera moves from 3.4 m to 1.2 m from the
      * player meanwhile, and the whole turn from the first frame looked like too much rotation. */
     const float ramp=(held && u3_aim_from_cover) ? w : 1.0f;
-    const float hd=wrap_degrees(h0-(u3_aim_base_yaw+(u3_aim_total_yaw-u3_aim_base_yaw)*ramp)), ed=e0-(u3_aim_base_pitch+(u3_aim_total_pitch-u3_aim_base_pitch)*ramp);
+    float hd=wrap_degrees(h0-(u3_aim_base_yaw+(u3_aim_total_yaw-u3_aim_base_yaw)*ramp)); const float ed=e0-(u3_aim_base_pitch+(u3_aim_total_pitch-u3_aim_base_pitch)*ramp);
     u3_aim_last_heading=hd; u3_aim_last_elev=ed;   /* what the release hands to the walking camera */
     u3_layer_heading=hd; u3_layer_elev=ed; u3_layer_us=now;
+    {   /* (BB_U3_HEADLP, BB_U3_HEADLPSHOW=0 off) the picture is written HERE: it shows the same smoothed heading Drake's body follows through 11e0, or he drags behind the camera (2026-11-15) */
+        static int tsh=-1; if (tsh<0) { const char *e=getenv("BB_U3_HEADLPSHOW"); tsh=!(e && e[0]=='0'); }
+        if (tsh && held && (u3_aim_from_cover || u3_aim_cover_swap) && ramp>=0.999f && u3_head_ts_us && now>=u3_head_ts_us && now-u3_head_ts_us<60000) hd=u3_head_ts;
+    }
     const float ya=-wrap_degrees(hf-hd)*0.017453293f*0.5f, pa=(ef-ed)*0.017453293f*0.5f;
     const float qyaw[4]={0.0f,SDL_sinf(ya),0.0f,SDL_cosf(ya)}, qpitch[4]={SDL_sinf(pa),0.0f,0.0f,SDL_cosf(pa)};
     float tq[4], q[4];
@@ -5805,6 +5854,33 @@ static void __attribute__((ms_abi)) u3_layer_blend_impl(uint64_t rdi, uint64_t r
     } else {
         for (int i=0;i<3;++i) { p[i]=np[i]; p[4+i]=q[i]; }
         p[7]=q[3];
+    }
+    {   /* (2026-11-14 test, BB_U3_COLLLP=<0..1>, 1 = off; sonde HLOOP/HLOOPA) aim born in a cover, fast mouse sweep: the game's own pose (its wall collision answers one update late) shakes the camera round Drake: azimuth 0.72 degrees rms and radius 1.3 cm against 0.38 / 0.7 with our own pose (Drake's body and position measured still). Polar low-pass round the player, of the radius and of the azimuth RELATIVE to the pose heading (noise only: no lag on the turn itself) */
+        static float lpk=-1.0f; if (lpk<0.0f) { const char *e=getenv("BB_U3_COLLLP"); lpk=e && e[0] ? (float)atof(e) : 0.25f; }   /* (0.25 default: "better but still there" in play, 2026-11-14; 0.12 and 0.15 no better) */
+        static float s_rad, s_az; static uint64_t s_us, s_cam;
+        float ft[3];
+        int ftok=0;
+        if (lpk<1.0f && held && (u3_aim_from_cover || u3_aim_cover_swap) && u3_head_act_us && now>=u3_head_act_us && now-u3_head_act_us<100000) {
+            ftok=u3_player_feet(r14,ft);
+            {   /* (BB_U3_FOLLOWD=0: off) anchor on Drake's REAL position A+0xf0 (world), not on the fixed pivot A+0x4d0: measured 2026-11-14, while the aim turns Drake drifts sideways 2-5 cm per update in jerks (7-22% of the updates move him > 4 cm with the mouse, 1% with the pad) and the camera orbits a fixed point, so he trembles on screen; the camera now keeps its offset from where he really is */
+                static int fd=-1; if (fd<0) { const char *e=getenv("BB_U3_FOLLOWD"); fd=!(e && e[0]=='0'); }
+                uint64_t hq3=0, A3=0; float dp[3];
+                if (fd && ftok && safe_read(&hq3,r14+0xb0,8) && hq3 && safe_read(&A3,hq3,8) && A3 && safe_read(dp,A3+0xf0,12) && SDL_fabsf(dp[0]-ft[0])<2.5f && SDL_fabsf(dp[2]-ft[2])<2.5f) { ft[0]=dp[0]; ft[2]=dp[2]; ft[1]=dp[1]; }
+            }
+        }
+        if (ftok) {
+            const float fx=2.0f*(p[4]*p[6]+p[7]*p[5]), fz=1.0f-2.0f*(p[4]*p[4]+p[5]*p[5]);
+            const float dx=p[0]-ft[0], dz=p[2]-ft[2], rad=SDL_sqrtf(dx*dx+dz*dz);
+            if (rad<4.0f && (fx*fx+fz*fz)>0.01f) {   /* (the offset from the player in the pose's own frame: right/forward; linear, so no singularity when the camera passes near the player: the first, polar version jumped by up to 1 m there) */
+                const float fl=SDL_sqrtf(fx*fx+fz*fz), s=fx/fl, c=fz/fl;
+                const float a=dx*c-dz*s, b=dx*s+dz*c;
+                static float s_y; const float yy=p[1]-ft[1];
+                const float jmp=SDL_fabsf(a-s_az)+SDL_fabsf(b-s_rad)+SDL_fabsf(yy-s_y);   /* (a real move of the camera, a wall pulling it in: no lag) */
+                if (s_cam==r14 && s_us && now>s_us && now-s_us<100000 && jmp<0.25f) { s_rad+=lpk*(b-s_rad); s_az+=lpk*(a-s_az); s_y+=lpk*(yy-s_y); } else { s_rad=b; s_az=a; s_y=yy; }
+                s_us=now; s_cam=r14;
+                p[0]=ft[0]+s_az*c+s_rad*s; p[2]=ft[2]-s_az*s+s_rad*c; p[1]=ft[1]+s_y;
+            } else s_us=0;
+        } else s_us=0;
     }
     if (held) { for (int i=0;i<3;++i) u3_aim_fin[i]=p[i]; for (int i=0;i<4;++i) u3_aim_fin[3+i]=p[4+i]; u3_aim_fin_us=now; }   /* (the aiming camera's own final pose, for u3 RELOADFOLLOW) */
     if (mouse_debug()) {   /* what is finally shown: position, heading and elevation of the pose written */
