@@ -736,6 +736,7 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
         if ((is_u1 || getenv("BB_SKIP_U2_WIDGET")) && strstr(c->name,"U2 list widget")) continue;
+        if (strstr(c->name,"collision send trace") && !getenv("BB_U3_SENDTRACE")) continue;   /* debug trace: only installed on request */
         if (!runtime_u3_game && strstr(c->name,"U3 list widget")) continue;   /* only once an unmistakable U3 hook (the text probe) is in */
         if (!mapped(segments,ns,c->offset,c->signature_size) ||
             memcmp(image+c->offset,c->signature,c->signature_size)) continue;
