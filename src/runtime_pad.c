@@ -6041,7 +6041,8 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
                 if (heading==heading) {
                     corr=wrap_degrees(heading-u3_wt_slot[sl].target);
                     const uint64_t still=u3_wt_slot[sl].moved_us && now>u3_wt_slot[sl].moved_us ? now-u3_wt_slot[sl].moved_us : 0;
-                    const int resting=!u3_wt_slot[sl].moved_us || (still>150000 && (SDL_fabsf(corr)<0.5f || still>500000));
+                    static unsigned lag_still=0xffffffffu; if (lag_still==0xffffffffu) { const char *e=getenv("BB_U3_LAGSTILL"); lag_still=e && e[0] ? (unsigned)atoi(e) : 400000u; }   /* (150000 = old; validated in play 2026-11-15: how long after the mouse stops the spring's lag is still made up) */
+                    const int resting=!u3_wt_slot[sl].moved_us || (still>lag_still && (SDL_fabsf(corr)<0.5f || still>500000));
                     if (deg>0.001f || deg<-0.001f) u3_wt_slot[sl].moved_us=now;
                     {   /* the spring's lag: the position is put back on the direction's heading (as at the start of the turn), about the pivot, at the distance it has */
                         static int rigid=-1; if (rigid<0) { const char *e=getenv("BB_U3_WTRIGID"); rigid=!(e && atoi(e)==0); }
@@ -6069,7 +6070,8 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
                 const float ph=heading_of(rel);
                 printf("Mouse: U3 WT cam=%llx before=%.2f deg=%.2f corr=%.2f after=%.2f pos_before=%.2f pos_after=%.2f t=%.4f\n",(unsigned long long)camera,(double)h1,(double)deg,(double)corr,(double)wrap_degrees(h1-total_turn),(double)ph,(double)wrap_degrees(ph-total_turn),now*1e-6);
             }
-            if (total_turn>0.001f || total_turn<-0.001f || lagfix>0.5f || lagfix<-0.5f) {   /* direction and position shown turned about the pivot, as follow_camera does */
+            static float lag_min=-1.0f; if (lag_min<0.0f) { const char *e=getenv("BB_U3_LAGMIN"); lag_min=e && e[0] ? (float)atof(e) : 0.05f; }   /* (0.5 = old; validated in play 2026-11-15: the heading rang +-0.2 degree per frame after a stop, under the 0.5 degree gate) */
+            if (total_turn>0.001f || total_turn<-0.001f || lagfix>lag_min || lagfix<-lag_min) {   /* direction and position shown turned about the pivot, as follow_camera does */
                 float *d=(float *)(uintptr_t)(camera+0x78c0), *pos=(float *)(uintptr_t)(camera+0x7680);
                 const float *pivot=(const float *)(uintptr_t)(camera+0x78a0);
                 const float a=total_turn*0.017453293f, c=SDL_cosf(a), s=SDL_sinf(a), ap=(total_turn+lagfix)*0.017453293f, cp=SDL_cosf(ap), sp=SDL_sinf(ap);
@@ -6084,7 +6086,8 @@ static void __attribute__((ms_abi)) u3_walk_camera(uint64_t out, uint64_t camera
                     camera_hook_us=now; u3_wt_push_us=now;
                 }
             }
-            if (u3_wt_push_us && now-u3_wt_push_us>40000 && follow_push!=0.0f) follow_push=0.0f;   /* (the mouse has stopped) */
+            static unsigned push_hold_us=0xffffffffu; if (push_hold_us==0xffffffffu) { const char *e=getenv("BB_U3_PUSHHOLD"); push_hold_us=e && e[0] ? (unsigned)atoi(e) : 40000u; }   /* (test, 2026-11-15: how long the right-stick push stays after the mouse stops; the heading rang +-0.2 degree every frame for 0.1-0.5 s after a stop) */
+            if (u3_wt_push_us && now-u3_wt_push_us>push_hold_us && follow_push!=0.0f) follow_push=0.0f;   /* (the mouse has stopped) */
         }
         float arc;
         if (safe_read(&arc,camera+0x7874,4) && arc>-3.0f && arc<3.0f) {
@@ -6584,6 +6587,45 @@ static void __attribute__((ms_abi)) u3_coll_submit(uint64_t rdi, uint64_t rsi, u
                (double)fa,(double)fb,(double)max_dstart,(double)max_dradius,(double)radius,(double)vl);
     }
 }
+/* TRACE (BB_U3_SENDTRACE=1, logging only): every collision query the game sends, with its caller (return address
+ * as an image offset), at the entry of 0x11843d0 (one ray) and 0x1183fd0 (batch of rays). One line per caller per 250 ms.
+ * Finds which camera/probe fires while walking against a wall. */
+static const unsigned char u3_send_one_code[]={0x55,0x48,0x89,0xe5,0x41,0x57};
+static const unsigned char u3_send_batch_code[]={0x55,0x48,0x89,0xe5,0x41,0x57};
+static void u3_send_trace_log(int batch, uint64_t rdi, uint64_t rsi, uint64_t image) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("BB_U3_SENDTRACE"); on=(e && e[0] && e[0]!='0'); }
+    if (!on) return;
+    const RuntimeGuestRegs *g=(const RuntimeGuestRegs *)(uintptr_t)(guest_callback_rsp-0x60);
+    uint64_t ret=0;
+    if (!safe_read(&ret,guest_callback_rsp,8)) return;
+    static struct { uint64_t key, last, n; } tab[32];
+    int slot=-1;
+    for (int i=0;i<32;++i) if (tab[i].key==ret+(uint64_t)batch) { slot=i; break; }
+    if (slot<0) for (int i=0;i<32;++i) if (!tab[i].key) { slot=i; tab[i].key=ret+(uint64_t)batch; break; }
+    if (slot<0) return;
+    tab[slot].n++;
+    const uint64_t now=now_us();
+    if (tab[slot].last && now>=tab[slot].last && now-tab[slot].last<250000) return;
+    tab[slot].last=now;
+    float st[4]={0}, ve[4]={0}, rad=0.0f; uint64_t fl=0; int count=1;
+    safe_read(st,rsi,16);
+    if (batch) {
+        safe_read(ve,rsi+0x10,16); safe_read(&rad,rsi+0x20,4);
+        count=(int)(g->rcx&0xffffffffu); safe_read(&fl,g->rdx,8);
+    } else {
+        safe_read(ve,g->rdx,16); safe_read(&fl,g->rcx,8); rad=coll_saved_xmm0(g);
+    }
+    const uint64_t from=ret-image;
+    const float vl=SDL_sqrtf(ve[0]*ve[0]+ve[1]*ve[1]+ve[2]*ve[2]);
+    printf("Mouse: U3 SENDTRACE T=%.3f fn=%s from=%s%#llx n=%llu probe=%#llx count=%d start=(%.2f %.2f %.2f) vec=(%.2f %.2f %.2f) len=%.3f r=%.3f filt=%#x/%#x\n",
+           now*1e-6,batch?"batch":"one",from<0x4000000ull?"":"HOST+",(unsigned long long)(from<0x4000000ull?from:ret),
+           (unsigned long long)tab[slot].n,(unsigned long long)rdi,count,
+           (double)st[0],(double)st[1],(double)st[2],(double)ve[0],(double)ve[1],(double)ve[2],(double)vl,(double)rad,
+           (unsigned)(fl&0xffffffffu),(unsigned)(fl>>32));
+}
+static void __attribute__((ms_abi)) u3_send_one_trace(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) { (void)r14; u3_send_trace_log(0,rdi,rsi,image); }
+static void __attribute__((ms_abi)) u3_send_batch_trace(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14) { (void)r14; u3_send_trace_log(1,rdi,rsi,image); }
 /* The cover camera's own sweep for the mouse's direction (u3_cover_wall): one step per image at most, the result of the previous one. */
 static int u3_cover_wall_fraction(const float *start4, const float *vec4, float radius, float *frac) {
     static CollProbe probe; static uint64_t last_us, fresh_us;
@@ -6604,6 +6646,8 @@ static const RuntimeGuestCallback guest_callbacks[]={
 #ifdef _WIN32
     {"U3 collision probe (submit)",0x4ce050,u3_coll_submit_code,sizeof(u3_coll_submit_code),6,u3_coll_submit,NULL},
     {"U3 collision probe (read)",0x4ce160,u3_coll_read_code,sizeof(u3_coll_read_code),8,u3_coll_read,NULL},
+    {"U3 collision send trace (one ray)",0x11843d0,u3_send_one_code,sizeof(u3_send_one_code),6,u3_send_one_trace,NULL},
+    {"U3 collision send trace (batch)",0x1183fd0,u3_send_batch_code,sizeof(u3_send_batch_code),6,u3_send_batch_trace,NULL},
 #endif
     {"U3 aiming camera (output)",0x515128,u3_aim_out_code,sizeof(u3_aim_out_code),7,u3_aim_out,NULL},
     {"U3 look state (observe)",0x500a26,u3_look_state_code,sizeof(u3_look_state_code),8,u3_look_state,NULL},
@@ -7187,6 +7231,10 @@ static void menu_update(const bool *k, uint32_t mouse) {
         const int f8=k && k[SDL_SCANCODE_F8];
         if (f8 && !f8_was_down && menu_mode) menu_data_snapshot();
         f8_was_down=f8;
+        static int f6_was_down;   /* F6 = time marker for the log (Tab opens the journal): "Mouse: MARK" */
+        const int f6=k && k[SDL_SCANCODE_F6];
+        if (f6 && !f6_was_down) printf("Mouse: MARK F6 T=%.3f\n",now_us()*1e-6);
+        f6_was_down=f6;
     }
     if (k && menu_mode) {
         /* Alt/Esc only mean "resume" while the pause is open (clock stopped); in the main menu the clock runs and Esc just goes back */
